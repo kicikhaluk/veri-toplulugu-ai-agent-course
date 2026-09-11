@@ -1,5 +1,5 @@
 ---
-layout: page
+layout: default
 title: Prompt Engineering and Techniques
 permalink: /prompt-engineering/
 ---

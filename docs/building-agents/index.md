@@ -1,5 +1,5 @@
 ---
-layout: page
+layout: default
 title: Building an Agent from Scratch with Claude
 permalink: /building-agents/
 ---

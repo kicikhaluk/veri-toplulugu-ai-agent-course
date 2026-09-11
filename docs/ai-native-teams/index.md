@@ -1,5 +1,5 @@
 ---
-layout: page
+layout: default
 title: AI-Native Teams
 permalink: /ai-native-teams/
 ---
