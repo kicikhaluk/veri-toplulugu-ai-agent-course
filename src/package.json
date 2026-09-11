@@ -8,7 +8,8 @@
     "01": "tsx 01-first-call/main.ts",
     "02": "tsx 02-loop-v0/main.ts",
     "03": "tsx 03-filesystem/main.ts",
-    "04": "tsx 04-search-and-bash/main.ts"
+    "04": "tsx 04-search-and-bash/main.ts",
+    "05": "tsx 05-server-tools/main.ts"
   },
   "keywords": [],
   "author": "",
