@@ -737,3 +737,81 @@ Three things worth carrying forward:
 - **A `stop_reason` you don't check is a failure mode you can't see.** `pause_turn` looks like nothing went wrong — no error, no `is_error`, just a shorter answer than the task warranted. The only defense is checking for it explicitly, the same discipline as checking `is_error` on a tool result.
 
 Every module so far has had Wrangler act entirely on its own machine, or on Anthropic's — but "outside systems" so far has meant a fixed allowlist you wrote by hand (`ALLOWED_COMMANDS` in Module 4) or a web search Anthropic runs for you. Module 6 asks a different question: what happens when you want Wrangler to talk to a *specific* external system — a database, an internal API, another team's tool server — that neither of those covers.
+
+## Module 6 — Wiring in outside systems: the MCP connector
+
+MCP (the Model Context Protocol) is an open standard for exposing a set of tools over HTTP, so that any client speaking the protocol can call them without custom integration code per server. Normally, using an MCP server means running an MCP *client* yourself — a piece of your process that speaks the protocol, connects to the server, lists its tools, and forwards calls. The **MCP connector** is a beta Anthropic feature that skips that middle layer entirely: you tell the Messages API a server URL and a name, and Anthropic connects to it, lists its tools, and lets Claude call them — server-side, the same way `web_search` and `code_execution` were server-side in Module 5.
+
+This module connects Wrangler to a real, public MCP server: [DeepWiki](https://mcp.deepwiki.com/mcp), which answers questions about public GitHub repositories and requires no authentication — a genuine external system, not a mock.
+
+### Two parameters, and a beta header
+
+```typescript
+const response = await client.beta.messages.create({
+  model: "claude-haiku-4-5",
+  max_tokens: 1024,
+  betas: ["mcp-client-2025-11-20"],
+  mcp_servers: [{ type: "url", url: "https://mcp.deepwiki.com/mcp", name: "deepwiki" }],
+  tools,
+  messages,
+});
+```
+
+`mcp_servers` names the connection; `tools` must include a matching entry so Claude knows which tools from that server to expose:
+
+```typescript
+{ type: "mcp_toolset", mcp_server_name: "deepwiki" }
+```
+
+That's the whole configuration. Unlike every tool this course has written by hand, an `mcp_toolset` has no `input_schema` of its own — the server defines its tools, and the connector discovers them at request time. (`mcp_toolset` also takes optional `default_config` / `configs` fields for allowlisting or denylisting individual tools by name once you know what a server exposes — worth reaching for on a server with write or destructive tools, so Claude only ever sees the read-only ones. DeepWiki is read-only already, so this module doesn't need it.)
+
+### A parallel set of types, because this is `client.beta`
+
+Everything up to this point called `client.messages.create`. The MCP connector is beta, which means calling it goes through `client.beta.messages.create` instead — and that's not a cosmetic difference. The beta surface has its own content block types, its own message param type, its own tool union: `Anthropic.Beta.BetaMessageParam`, `Anthropic.Beta.BetaToolUnion`, `Anthropic.Beta.BetaToolUseBlock`, `Anthropic.Beta.BetaToolResultBlockParam` — parallel to, but not interchangeable with, the `Anthropic.MessageParam` / `Anthropic.Messages.ToolUnion` / `Anthropic.ToolUseBlock` / `Anthropic.ToolResultBlockParam` every prior module used. A `BetaMessage`'s `content` is `BetaContentBlock[]`, not `ContentBlock[]`; mixing the two — say, passing a non-beta `tool_result` into a beta message — is a type error, not a runtime surprise. The four filesystem tools carried forward from Module 3 don't need any code changes to work here (`BetaTool` and `Tool` are structurally identical), but the *types wrapping them* all had to switch to their `Beta`-prefixed counterparts, everywhere this module's `main.ts` touches a message or a tool.
+
+### Running it
+
+```
+cd src
+npx tsx 06-mcp-connector/main.ts
+```
+
+The prompt asks Wrangler to read a local file, answer a question by querying DeepWiki, and write the answer back:
+
+```
+turn 1 — read_file({ path: 'research-notes.md' })          [client tool_use]
+       — mcp_tool_use: deepwiki.ask_question({
+           repoName: 'anthropics/anthropic-sdk-typescript',
+           question: 'What testing framework does this repository use?'
+         })                                                  [server-side, same turn]
+
+turn 2 — mcp_tool_result: "...primarily uses Jest... jest.config.ts... ts-jest..." (real answer, from a real repo)
+       — edit({ path: 'research-notes.md', old_str: '# Research Notes\n...', new_str: '...## Findings\n\nThe anthropics/anthropic-sdk-typescript repository primarily uses **Jest**...' })   [client tool_use]
+
+turn 3 — stop_reason: 'end_turn'
+       final answer, summarizing what was read, queried, and written
+```
+
+Notice turn 1: `read_file` and the DeepWiki call arrived in the *same* response, side by side — batched, not serialized. That's Module 4's orchestration lesson showing up again from a new angle. Reading a local file and asking a question about a GitHub repository don't depend on each other, so Claude issued both at once — one resolved by your `executeTool` dispatcher, one resolved entirely on Anthropic's servers by the time the response reached you. Independence drives batching regardless of *where* a tool runs; Module 4 showed it for two local tools, Module 5 showed a dependent chain mixing local and Anthropic-hosted tools, and this run shows a local tool and a remote MCP tool batching together because nothing tied them to each other.
+
+The `mcp_tool_use` / `mcp_tool_result` block types are the same story as `server_tool_use` in Module 5, one layer further out: they're their own distinct types, so the existing `block.type === "tool_use"` filter already ignores them without any change. Nothing in `executeTool` knows or needs to know that `deepwiki` exists — the dispatcher's job stayed exactly what it was.
+
+### The browser-handoff pattern (design, not demo)
+
+DeepWiki needed no `authorization_token` — that's why this module could run against it live. Most real MCP servers you'd actually want to wire in (a team's internal Jira, a company database) sit behind OAuth, and `mcp_servers` supports that directly:
+
+```typescript
+{ type: "url", url: "https://mcp.example.com/sse", name: "jira", authorization_token: "..." }
+```
+
+The token has to come from somewhere, and the honest answer is: not from Wrangler. An agent has no business running an interactive OAuth flow — no browser to redirect, no way to click "Allow" on a consent screen. The correct pattern is a **handoff**: when a tool result signals that authorization is missing (an `mcp_tool_result` with `is_error: true` and content describing an auth failure, or simply no token configured yet for that server), the agent stops, tells the human what it needs and why, and hands them a URL to complete in their own browser — after which the resulting token gets stored (an environment variable, a config file Wrangler reads on startup) and the same request just works on retry. This course's own [MCP inspector aside](https://platform.claude.com/docs/en/agents-and-tools/mcp-connector#authentication) in Anthropic's docs is a manual version of exactly that flow: run a tool, authorize in a browser, paste the resulting token back in.
+
+This is deliberately presented as a pattern rather than a demo: DeepWiki doesn't require auth, so this course has no OAuth-gated server to test the handoff against live, and this book's standing rule is not to claim a run happened when it didn't. The shape is still worth internalizing now, because it's the same shape Module 9 will formalize for *any* action Wrangler shouldn't take unilaterally — asking a human, waiting for an explicit answer, then proceeding.
+
+Three things worth carrying forward:
+
+- **A remote tool server is a `tools` entry, not a new code path.** `mcp_toolset` slots into the same array as `list_dir` and `web_search` — the loop, the dispatcher, and the batching behavior don't change because a tool happens to live on someone else's server.
+- **Beta features bring beta types, and they don't mix with the stable ones.** `client.beta.messages.create` isn't just a different method name — every type touching that call (`BetaMessageParam`, `BetaToolUnion`, `BetaToolUseBlock`, `BetaToolResultBlockParam`) has to come from the same beta surface, consistently, or TypeScript will catch the mismatch before you ever hit send.
+- **Independence, not location, drives batching.** Whether a tool runs in your process, on Anthropic's infrastructure, or on a third party's MCP server three network hops away, Claude batches it with anything else in the same turn precisely when the two don't depend on each other — never because of where either one happens to execute.
+
+Every tool through Module 6 has done its work and reported back in the same request-response cycle Wrangler was already built around. That cycle has a cost nobody's had to think about yet: every module in this course has grown the transcript, and `messages` has never once been trimmed. Module 7 is where that stops being free — prompt caching, summarizing old tool results, and compaction, all in service of a `messages` array that can outlive its own context window.
