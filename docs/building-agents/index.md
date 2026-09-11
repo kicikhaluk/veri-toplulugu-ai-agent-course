@@ -515,3 +515,136 @@ Four things worth carrying forward from this module:
 - **The model didn't need to be told not to try `../secrets.txt` — it tried anyway, because you told it to ("just to see what happens").** In a real agent, that curiosity doesn't announce itself as a test; it shows up as an ordinary-looking path that happens to walk out of bounds. The guard has to hold regardless of whether the model's intent was adversarial or completely innocent.
 
 Module 4 keeps the same guard and the same `is_error` pattern, and adds the tools that make an agent feel genuinely useful on a real project: a search/grep tool, and a `bash` tool gated behind an allowlist — which is also where parallel tool use stops being a curiosity and starts being something you have to actively think about.
+
+## Module 4 — Search, a gated bash tool, and orchestration in practice
+
+Wrangler now has four filesystem tools, carried over unchanged from Module 3. This module adds two more — `search` and `run_command` — and, more importantly, is where you start noticing that "the loop" and "the tools" aren't really separate concerns: how the model orchestrates several tools across several turns depends entirely on what your tool descriptions and results tell it.
+
+### `search`: a purpose-built tool
+
+`run_command` could technically do a text search — `grep -r` is right there. But a narrow, purpose-built tool that returns structured, capped output is worth writing separately whenever a task is common enough to deserve it: it's safe by construction (no shell, no argument-escaping to worry about), and its output is shaped for the model to consume directly, rather than free-form terminal text it has to parse.
+
+```typescript
+const MAX_SEARCH_MATCHES = 100;
+
+async function searchTool(rawInput: unknown): Promise<string> {
+  const input = rawInput as Record<string, unknown>;
+  const pattern = expectString(input.pattern, "pattern");
+  const relDir = typeof input.path === "string" ? input.path : ".";
+  const searchRoot = resolveSafePath(relDir);
+  const regex = new RegExp(pattern);
+
+  const matches: string[] = [];
+
+  async function walk(dir: string): Promise<void> {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (matches.length >= MAX_SEARCH_MATCHES) return;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile()) {
+        let content: string;
+        try {
+          content = await readFile(full, "utf-8");
+        } catch {
+          continue; // skip unreadable/binary files
+        }
+        const relToRoot = path.relative(workspaceRoot, full);
+        const lines = content.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          if (matches.length >= MAX_SEARCH_MATCHES) break;
+          const line = lines[i];
+          if (line !== undefined && regex.test(line)) {
+            matches.push(`${relToRoot}:${i + 1}: ${line}`);
+          }
+        }
+      }
+    }
+  }
+
+  await walk(searchRoot);
+  return matches.length > 0 ? matches.join("\n") : "(no matches)";
+}
+```
+
+Two details worth noticing: `resolveSafePath` still runs, once, on the *starting* directory the model supplied — everything `walk` discovers after that comes from `readdir`, not from the model, so it can't be used to escape the sandbox. And `MAX_SEARCH_MATCHES` caps the result — an unbounded match list on a big enough workspace would blow past the context you have to spend on it, which is the same `usage`-growth concern Module 2 flagged, just arriving from a different direction.
+
+### `run_command`: a generic escape valve, gated twice
+
+Sometimes there's no purpose-built tool for what's needed, and writing one for every possible command isn't realistic. `run_command` is the fallback — but a fallback that runs arbitrary shell input is a fallback that undoes every guard you've built so far, so it's restricted in two independent ways.
+
+**First gate — no shell at all.** The tool takes a `command` string and an `args` array as *separate* fields, and executes them with `execFile`, not `exec`. `execFile` never hands the string to `/bin/sh`, so there's no shell to inject into — a value like `"; rm -rf /"` in an argument is just a literal argument, not a command separator, because no shell ever parses it.
+
+```typescript
+const ALLOWED_COMMANDS = new Set(["ls", "cat", "wc", "head", "tail", "pwd", "git"]);
+
+function assertArgsConfined(args: string[]): void {
+  for (const arg of args) {
+    if (arg.startsWith("-")) continue; // a flag, not a path
+    resolveSafePath(arg);
+  }
+}
+
+async function runCommand(rawInput: unknown): Promise<string> {
+  const input = rawInput as Record<string, unknown>;
+  const command = expectString(input.command, "command");
+  const argsRaw = input.args;
+  if (!Array.isArray(argsRaw) || !argsRaw.every((a) => typeof a === "string")) {
+    throw new Error('Expected "args" to be an array of strings');
+  }
+  const args = argsRaw as string[];
+
+  if (!ALLOWED_COMMANDS.has(command)) {
+    throw new Error(`"${command}" is not in the allowlist (${[...ALLOWED_COMMANDS].join(", ")})`);
+  }
+  assertArgsConfined(args);
+
+  const { stdout, stderr } = await execFileAsync(command, args, {
+    cwd: workspaceRoot,
+    timeout: 5000,
+  });
+  return stdout || stderr || "(no output)";
+}
+```
+
+**Second gate — the same path guard, applied to arguments.** Restricting *which binary* runs isn't enough: `cat` is harmless in the abstract, but `cat ../../../etc/passwd` isn't, and an allowlist that only checks the command name would wave it straight through. `assertArgsConfined` runs every non-flag argument through `resolveSafePath` — the exact function `read_file` and `edit` already use — before `execFile` ever starts the process. Reusing it here instead of writing a second path check is the point: one guard, audited once, trusted everywhere it's needed.
+
+Worth being honest about the limits, too: skipping arguments that start with `-` is a heuristic, not a parser — something like `--file=../secret` would slip past it uncaught, since it doesn't start with a bare path. Good enough to teach the idea inside a sandboxed demo; not something to ship as your only defense on a tool that shells out for real. `timeout: 5000` is the other quiet addition — a hung subprocess shouldn't be able to hang your agent, a concern that'll come back properly in Module 9's guardrails.
+
+### Running it: six tools, and a loop that stops parallelizing when it should
+
+This is `src/04-search-and-bash/main.ts` in full, working against `src/04-search-and-bash/workspace/` — a tiny two-file fake project with a few `TODO` comments seeded in, plus a file one level above the sandbox root to test the guard against. Run it:
+
+```bash
+cd src
+npx tsx 04-search-and-bash/main.ts
+```
+
+The prompt asks for a chain of dependent steps: search for `TODO`s, find the file with the most, count its lines, read it for context, then try to `cat` a file outside the sandbox. Real output, trimmed to the tool calls:
+
+```
+turn 1 — search({ pattern: 'TODO', path: '.' })
+  → "src/index.ts:2: ...\nsrc/util.ts:2: ...\nsrc/util.ts:3: ..."
+
+turn 2 — run_command({ command: 'wc', args: ['-l', 'src/util.ts'] })
+  → "       5 src/util.ts\n"
+
+turn 3 — read_file({ path: 'src/util.ts' })
+  → "export function formatName(first: string, last: string): string {\n  // TODO: ...\n..."
+
+turn 4 — run_command({ command: 'cat', args: ['../secret-outside.txt'] })
+  → is_error: true — '"../secret-outside.txt" resolves outside the workspace root — refusing.'
+
+turn 5 — stop_reason: 'end_turn', Claude summarizes all four steps, guard test included
+```
+
+Notice what *didn't* happen: every one of those tool calls arrived **alone**, one per turn, across five separate round trips — not batched, even though Module 2's arithmetic example batched two `calculate` calls into a single turn without being asked to. The model isn't choosing to be slow; each step here genuinely depends on the result of the last one (you can't count lines in "whichever file has the most TODOs" until you've seen the search results, and you can't decide the guard test matters until the rest is done). Parallel tool use is something Claude does when calls are independent, not something you request — which means the shape of your prompt, and how contingent each step is on the one before it, drives how much of your agent's latency comes from serialized round trips versus batched ones. That's the "orchestration in practice" this module's title promises: you don't control the batching directly, but you can see it happening, and you can design tools and prompts so the independent parts of a task actually are independent.
+
+Three things worth carrying forward:
+
+- **Purpose-built and generic tools solve different problems, and a mature toolset has both.** `search` is safe by construction with structured output; `run_command` covers everything you didn't anticipate, at the cost of needing its own, more careful guarding.
+- **`execFile`, not `exec`.** Passing `command` and `args` as separate fields — never a single shell string — means there's no shell for an injected argument to reach. This is a design choice in the tool's input schema, not just an implementation detail: the schema itself is what stops the model from ever having the *option* to hand you `"cat file; rm -rf ."` as one string.
+- **Reuse guards instead of re-deriving them.** `assertArgsConfined` isn't a new security mechanism — it's `resolveSafePath`, called from a second place. Every new tool that touches paths should be asking "can I route this through the guard I already have," not writing a fresh one.
+
+Every tool so far has run under your direct authority — Wrangler does exactly what you told it it's allowed to do, the moment it's told. Module 5 introduces tools Anthropic hosts and runs *for* you (web search, code execution) rather than ones your process executes, which changes what "the loop" has to account for — including a new `stop_reason` you haven't seen yet.
