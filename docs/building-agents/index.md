@@ -648,3 +648,92 @@ Three things worth carrying forward:
 - **Reuse guards instead of re-deriving them.** `assertArgsConfined` isn't a new security mechanism — it's `resolveSafePath`, called from a second place. Every new tool that touches paths should be asking "can I route this through the guard I already have," not writing a fresh one.
 
 Every tool so far has run under your direct authority — Wrangler does exactly what you told it it's allowed to do, the moment it's told. Module 5 introduces tools Anthropic hosts and runs *for* you (web search, code execution) rather than ones your process executes, which changes what "the loop" has to account for — including a new `stop_reason` you haven't seen yet.
+
+## Module 5 — Server tools: web search and code execution
+
+Every tool up to this point has followed the same shape: Claude asks, your process runs something, you report a result back. That's true of `read_file`, and it's true of `run_command` — even though `run_command` shells out to a real subprocess, *your* process still owns that subprocess, decides whether it's allowed to run, and reports the outcome.
+
+Anthropic also hosts a handful of tools that skip that middle step entirely. `web_search` and `code_execution` run on Anthropic's own infrastructure — you don't spawn anything, you don't guard a path, you don't get a `tool_use` block asking you to act. You just declare the tool, and results show up already resolved inside the response. That's a genuinely different kind of tool, and it changes two things about the loop: what `tools` can contain, and what a single response can mean.
+
+### Declaring a server tool
+
+A client tool is `{ name, description, input_schema }`. A server tool is a version-suffixed `type` and a `name` — no schema, because you're not the one producing the input:
+
+```typescript
+const tools: Anthropic.Messages.ToolUnion[] = [
+  // ...list_dir, read_file, write_file, edit, search, run_command from Module 4, unchanged...
+  { type: "web_search_20250305", name: "web_search", max_uses: 3 },
+  { type: "code_execution_20260120", name: "code_execution" },
+];
+```
+
+Two things worth noticing before the code even runs. First, the type annotation changed: Modules 3 and 4 declared `tools: Anthropic.Tool[]`, but `Tool` is specifically the *custom*-tool shape — it has no `type` field for `"web_search_20250305"` to occupy. `Anthropic.Messages.ToolUnion` is the type that covers both custom tools and Anthropic-defined ones, so mixing the two kinds in one array means widening the annotation, not narrowing it.
+
+Second, `web_search_20250305` — not the newer `web_search_20260209`. The 2026 version adds *dynamic filtering* (Claude writes and runs code to filter search results before they reach the context window), but that capability is currently scoped to Opus and Sonnet-tier models; Haiku 4.5, which this course has used throughout, stays on the older, simpler tool version. Same idea applies if you swap models later — check what a given `_2026...` tool version actually supports on the model you're pointing it at, rather than assuming the newest suffix is always the right one.
+
+### Mixing client and server tools in one loop
+
+The dispatcher (`executeTool`, the `switch` over tool names) doesn't change at all — and that's the point worth sitting with. Look at how the loop decides what needs a `tool_result`:
+
+```typescript
+const toolUseBlocks = response.content.filter(
+  (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
+);
+```
+
+A client tool call arrives as a `tool_use` block, same as every module so far. A server tool call arrives as a `server_tool_use` block, and its result as its own block type (`web_search_tool_result`, `bash_code_execution_tool_result`) — both already sitting in `response.content` by the time you see it. They're different TypeScript types (`ToolUseBlock` vs. `ServerToolUseBlock`), so the existing filter already excludes server-tool activity without any change. Nothing to execute, nothing to report — Anthropic did that part before the response ever reached you.
+
+The one real addition is a new `stop_reason`:
+
+```typescript
+if (response.stop_reason === "pause_turn") {
+  // The server-side tool loop (web search / code execution) hit its
+  // iteration cap mid-turn. Nothing for us to execute — just re-send so
+  // Anthropic resumes where it left off.
+  continue;
+}
+```
+
+Server tools run their own internal loop — Claude can call `web_search` or `code_execution` several times in a row, server-side, chasing one answer. If that internal loop hits its default cap of 10 iterations before it's done, the response comes back with `stop_reason: "pause_turn"` instead of `"tool_use"` or `"end_turn"`. There's no tool result to send; you just push the assistant turn back onto `messages` and ask again — the API reads the trailing `server_tool_use` block and resumes automatically. Skip this check and a paused turn looks exactly like a finished one: the loop breaks, you get a truncated answer, and nothing tells you it happened.
+
+### Running it
+
+```
+cd src
+npx tsx 05-server-tools/main.ts
+```
+
+The prompt chains a client read, a server computation, a server search, and a client write: read `data.csv`, compute mean and standard deviation with `code_execution`, look up the year Claude first launched with `web_search`, then `write_file` a summary. Real output, trimmed to what each turn did:
+
+```
+turn 1 — read_file({ path: 'data.csv' })
+  → "label,value\nrun_1,14.2\n...\n"
+
+turn 2 — server_tool_use: bash_code_execution
+  runs a small Python script (csv + statistics) against the file it already has from context
+  → bash_code_execution_tool_result: mean and stdev printed to stdout
+
+turn 3 — server_tool_use: web_search
+  → web_search_tool_result: 10 web_search_result entries (Wikipedia's "Claude (language model)" among them)
+
+turn 4 — write_file({ path: 'summary.md', content: '# Summary of Results\n\n## Data Analysis\n- Mean: 15.325\n- Standard Deviation: 1.066\n\n## Claude Model Release\n...' })
+  → "Wrote 444 bytes to summary.md"
+
+turn 5 — read_file({ path: 'summary.md' })   (Claude double-checking its own write)
+  → file contents echoed back
+
+turn 6 — stop_reason: 'end_turn'
+  final answer, with a real citation block: { type: 'web_search_result_location', url: 'https://en.wikipedia.org/wiki/Claude_(language_model)', cited_text: '...March 2023...' }
+```
+
+The mean (15.325) and standard deviation (1.066) are exactly right for the eight values in `data.csv` — that arithmetic happened in a real Python interpreter on Anthropic's infrastructure, not in Claude's own token generation. The citation on the final answer is real too: a URL, a title, and the exact cited span, attached because `web_search` results carry citation metadata by default. One small, honest wrinkle: the draft `summary.md` Claude wrote in turn 4 has a stray malformed `(cite index="4-3">...</cite>` fragment in it — a bit of its own citation markup that leaked into plain file content instead of staying in the response text. Nothing broke, but it's a good reminder for later: text a model writes into a file is still model output, not sanitized data, and Module 9's guardrails are exactly where "should this write have gone through unreviewed" gets a real answer.
+
+`pause_turn` didn't fire in this run — six turns is well under the server-side cap of 10 — so the `continue` branch above is genuinely untested by this particular transcript. That's fine, and it's the honest way to present it: you don't get to choose when a real API demo happens to exercise every branch, but you can still reason about *why* the branch has to exist and write it correctly ahead of needing it, the same way Module 4's `run_command` timeout was written before anything actually hung.
+
+Three things worth carrying forward:
+
+- **Not every tool is something you execute.** `web_search` and `code_execution` are declared, not implemented — no `input_schema`, no case in `executeTool`. The dispatcher's job is to handle the tools that need handling, not to have an opinion about the ones that don't.
+- **Content block *type* is what tells client tools and server tools apart, not which array they came from.** `tools` holds both kinds side by side; `response.content` is where they diverge — `tool_use` for you, `server_tool_use`/`*_tool_result` for Anthropic, already resolved.
+- **A `stop_reason` you don't check is a failure mode you can't see.** `pause_turn` looks like nothing went wrong — no error, no `is_error`, just a shorter answer than the task warranted. The only defense is checking for it explicitly, the same discipline as checking `is_error` on a tool result.
+
+Every module so far has had Wrangler act entirely on its own machine, or on Anthropic's — but "outside systems" so far has meant a fixed allowlist you wrote by hand (`ALLOWED_COMMANDS` in Module 4) or a web search Anthropic runs for you. Module 6 asks a different question: what happens when you want Wrangler to talk to a *specific* external system — a database, an internal API, another team's tool server — that neither of those covers.
