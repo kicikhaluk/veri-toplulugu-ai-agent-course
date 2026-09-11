@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Jekyll
+docs/_site/
+docs/.jekyll-cache/
+docs/.jekyll-metadata
+docs/Gemfile.lock
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Node
+node_modules/
+
+# Editors
+.vscode/
+.idea/

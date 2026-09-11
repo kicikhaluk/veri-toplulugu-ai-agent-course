@@ -1,0 +1,15 @@
+title: Veri Topluluğu AI Agent
+description: >-
+  A course on prompt engineering, building AI agents from scratch with Claude,
+  and an introduction to AI-native teams.
+theme: minima
+minima:
+  skin: auto
+show_downloads: false
+
+header_pages:
+  - prompt-engineering/index.md
+  - building-agents/index.md
+  - ai-native-teams/index.md
+
+markdown: kramdown
