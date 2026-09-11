@@ -5,7 +5,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "01": "tsx 01-first-call/main.ts"
+    "01": "tsx 01-first-call/main.ts",
+    "02": "tsx 02-loop-v0/main.ts"
   },
   "keywords": [],
   "author": "",
