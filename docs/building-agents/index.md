@@ -110,3 +110,202 @@ A few things worth noticing before we move on, because they explain the shape of
 - **`system` is separate from `messages`.** It's your standing instruction to the model, not part of the turn-by-turn history.
 
 Try changing the user message and re-running — notice there's no state carried over between runs. Next module, we make that history persistent across turns and add the first tool, which turns this one-shot call into the beginning of an actual agent loop.
+
+## Module 2 — The loop, v0
+
+This is the module that matters most. Everything from here on — filesystem access, web search, guardrails, evals — plugs into the exact loop you write in this section. Nothing about the loop itself changes later; only what's inside it grows.
+
+### Anatomy of a tool
+
+A tool is a name, a description, and a JSON Schema for its input. Claude never executes anything — it only ever emits a *request* to call a tool, as a `tool_use` content block. Your code decides whether, and how, to honor it.
+
+```typescript
+const tools: Anthropic.Tool[] = [
+  {
+    name: "calculate",
+    description:
+      "Evaluate a single arithmetic operation between two numbers. Call this for any arithmetic you need an exact answer for — never compute it yourself.",
+    input_schema: {
+      type: "object",
+      properties: {
+        operation: {
+          type: "string",
+          enum: ["add", "subtract", "multiply", "divide"],
+          description: "The operation to perform.",
+        },
+        a: { type: "number", description: "The first operand." },
+        b: { type: "number", description: "The second operand." },
+      },
+      required: ["operation", "a", "b"],
+    },
+  },
+];
+```
+
+The `description` is doing more work than it looks like. Claude decides *whether* to call a tool almost entirely from this text, so it's worth being explicit about *when* to call it ("never compute it yourself"), not just what it does — vague descriptions are the single most common reason a model skips a tool it should have used.
+
+### The stopping signal: `stop_reason`
+
+Every response carries a `stop_reason`. The two you'll see constantly:
+
+| `stop_reason` | Meaning | What you do |
+| --- | --- | --- |
+| `tool_use` | Claude emitted at least one `tool_use` block and wants the result before continuing | Execute the tool(s), send results back, loop again |
+| `end_turn` | Claude is done — no pending tool calls | Print the final text and stop |
+
+(There are others — `max_tokens`, `pause_turn`, `refusal` — that matter once we bring in longer runs and server-side tools. We'll handle those as they come up.)
+
+### The loop
+
+```typescript
+const messages: Anthropic.MessageParam[] = [
+  {
+    role: "user",
+    content:
+      "A workshop has 14 tables. Eleven of them seat 6 people each, and the remaining 3 seat only 4 people each. How many people can the workshop seat in total?",
+  },
+];
+
+while (true) {
+  const response = await client.messages.create({
+    model: "claude-haiku-4-5",
+    max_tokens: 1024,
+    tools,
+    messages,
+  });
+
+  // Dump the raw response so you can see the actual shape the API returns —
+  // id, model, stop_reason, usage, and the content block array — not just
+  // the parts we bother to summarize.
+  console.log("\n=== response ===");
+  console.dir(response, { depth: null });
+
+  // Always append the FULL response.content, not just the text — the
+  // tool_use blocks inside it are what let the next tool_result line up.
+  messages.push({ role: "assistant", content: response.content });
+
+  if (response.stop_reason !== "tool_use") {
+    break;
+  }
+
+  const toolUseBlocks = response.content.filter(
+    (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
+  );
+
+  const toolResults: Anthropic.ToolResultBlockParam[] = [];
+  for (const block of toolUseBlocks) {
+    const result = await executeTool(block.name, block.input);
+    toolResults.push({
+      type: "tool_result",
+      tool_use_id: block.id,
+      content: result,
+    });
+  }
+
+  // And the other half of the round trip: exactly what we send back.
+  console.log("\n=== tool_result(s) sent back ===");
+  console.dir(toolResults, { depth: null });
+
+  // All tool_result blocks go back in a single user message.
+  messages.push({ role: "user", content: toolResults });
+}
+```
+
+`executeTool` is the dispatcher — a `switch` on tool name that calls the matching function and returns a string:
+
+```typescript
+function calculate(input: { operation: string; a: number; b: number }): string {
+  const { operation, a, b } = input;
+  switch (operation) {
+    case "add":
+      return String(a + b);
+    case "subtract":
+      return String(a - b);
+    case "multiply":
+      return String(a * b);
+    case "divide":
+      return b === 0 ? "Error: division by zero" : String(a / b);
+    default:
+      return `Error: unknown operation "${operation}"`;
+  }
+}
+
+async function executeTool(name: string, input: unknown): Promise<string> {
+  switch (name) {
+    case "calculate":
+      return calculate(input as { operation: string; a: number; b: number });
+    default:
+      return `Error: no such tool "${name}"`;
+  }
+}
+```
+
+Note `input: unknown` — the model's `tool_use.input` is arbitrary JSON as far as TypeScript is concerned. We cast it here for brevity; from Module 3 onward, where tool inputs choose *which file gets touched*, we validate the shape before trusting it instead of casting blind.
+
+This is `src/02-loop-v0/main.ts` in full. Run it:
+
+```bash
+cd src
+npx tsx 02-loop-v0/main.ts
+```
+
+We're deliberately printing the *raw* `response` object (`console.dir(response, { depth: null })`) rather than a curated summary — reading the actual shape the API hands you is worth more, this early, than a tidy log line. First iteration, unedited (yours may batch the two multiplications differently):
+
+```
+=== response ===
+{
+  model: 'claude-haiku-4-5-20251001',
+  id: 'msg_011CexM83ma3axXbhUwASpGJ',
+  type: 'message',
+  role: 'assistant',
+  content: [
+    {
+      type: 'text',
+      text: 'I need to calculate the total seating capacity of the workshop.'
+    },
+    {
+      type: 'tool_use',
+      id: 'toolu_01HvkhVJapntMq7n7bVXTiaT',
+      name: 'calculate',
+      input: { operation: 'multiply', a: 11, b: 6 },
+      caller: { type: 'direct' }
+    },
+    {
+      type: 'tool_use',
+      id: 'toolu_017HMgBzNxFmV21Cf1pXitpU',
+      name: 'calculate',
+      input: { operation: 'multiply', a: 3, b: 4 },
+      caller: { type: 'direct' }
+    }
+  ],
+  container: null,
+  stop_reason: 'tool_use',
+  stop_sequence: null,
+  stop_details: null,
+  usage: {
+    input_tokens: 690,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    output_tokens: 167,
+    service_tier: 'standard'
+  }
+}
+
+=== tool_result(s) sent back ===
+[
+  { type: 'tool_result', tool_use_id: 'toolu_01HvkhVJapntMq7n7bVXTiaT', content: '66' },
+  { type: 'tool_result', tool_use_id: 'toolu_017HMgBzNxFmV21Cf1pXitpU', content: '12' }
+]
+```
+
+...then a second `response`/`tool_result` pair for the `add`, then a final `response` with `stop_reason: 'end_turn'` and no `tool_use` blocks at all — just the closing text. Run it yourself to see all three in full; there's more signal in scrolling through the real thing once than in any amount of prose here.
+
+Five things worth reading out of that structure directly, since you can now see them instead of taking them on faith:
+
+- **`content` is an array, and one `tool_use` block sits next to a `text` block.** Claude explained itself ("I need to calculate...") *and* called the tool in the same turn — text and tool calls are siblings in the same array, not alternatives.
+- **Claude called the tool twice in one turn.** Both multiplications arrived as two `tool_use` blocks in a *single* response — this is parallel tool use, on by default. Both results went back in one `user` message with two `tool_result` blocks, not two separate messages. Splitting them across messages is a common bug that silently trains the model to stop batching calls.
+- **Every `tool_use` block carries its own `id`, and the matching `tool_result` echoes it as `tool_use_id`.** That's the only thing linking a result to the call that requested it — nothing about ordering or position is load-bearing, the `id` is.
+- **`usage` is per-request, not cumulative**, and it grows each turn (690 → 918 → 1026 input tokens) because the *entire* history — including the tool calls and results you just saw — gets resent every time. This is the first concrete look at why Module 7 (context management) exists: an unbounded loop has unboundedly growing input cost.
+- **The loop ran three round trips**, not one: multiply × 2 → add → final answer. This is why it's a `while (true)`, not an `if`. A tool-using turn is not the end of the conversation; it's Claude asking for information before it can finish the conversation. `messages` ends up six entries long — your question, three assistant turns, and two `tool_result` replies — and every entry stays in the array, resent in full, for the life of the loop.
+
+Everything else in this course is this same shape: a `while` loop, a `tools` array, a dispatcher. Module 3 replaces the toy calculator with filesystem tools that touch real files on disk — which is also where "trust the model's input" stops being good enough.
