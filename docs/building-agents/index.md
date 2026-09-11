@@ -815,3 +815,188 @@ Three things worth carrying forward:
 - **Independence, not location, drives batching.** Whether a tool runs in your process, on Anthropic's infrastructure, or on a third party's MCP server three network hops away, Claude batches it with anything else in the same turn precisely when the two don't depend on each other — never because of where either one happens to execute.
 
 Every tool through Module 6 has done its work and reported back in the same request-response cycle Wrangler was already built around. That cycle has a cost nobody's had to think about yet: every module in this course has grown the transcript, and `messages` has never once been trimmed. Module 7 is where that stops being free — prompt caching, summarizing old tool results, and compaction, all in service of a `messages` array that can outlive its own context window.
+
+## Module 7 — Context management: caching, trimming, and compaction
+
+Every request Wrangler has made so far re-sends the entire conversation from scratch. The tool definitions, the system prompt (once it has one), every prior turn — all of it gets re-processed as fresh input tokens on every single call, even though most of it is byte-for-byte identical to the request before. Three mechanisms address three different parts of that problem: **prompt caching** pays once for content that doesn't change instead of every turn, **trimming old tool results** shrinks the parts of the transcript that were only ever useful in the moment, and **compaction** deals with the transcript itself once it's grown too large to keep around in full. This module adds all three to a fresh copy of Module 3's four filesystem tools, plus one new tool the trimming mechanism needs.
+
+### Prompt caching: paying once for what doesn't change
+
+A cache breakpoint is a marker — `cache_control: { type: "ephemeral" }` — on a content block, telling the API "everything up to and including this block is worth storing for reuse." The next request with an identical prefix up to that point reads it back at roughly a tenth of the normal input price instead of paying full price again. Render order is `tools` → `system` → `messages`, so a marker on the last system block caches the tools and the system prompt together in one entry:
+
+```typescript
+const response = await client.messages.create({
+  model: "claude-haiku-4-5",
+  max_tokens: 2048,
+  system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+  tools,
+  messages,
+});
+```
+
+Wrangler didn't have a system prompt before this module — the four filesystem tools' descriptions did all the instructing. This module gives it one: a real operating manual (workspace boundary, tool reference, communication style, error handling, common task patterns, an FAQ) — the kind of thing a production agent actually accumulates, not a paragraph invented to have something to cache.
+
+That "real length" turned out to matter for a very concrete reason. The minimum prefix length before a cache marker does anything at all is model-dependent, and it is **not** the same number you'd guess from other models — Claude Haiku 4.5 needs **4096 tokens**, several times higher than the 512–1024 tokens most other current models need. The first draft of this module's system prompt was a reasonable, tasteful length — and came in under that bar. Nothing errored. The tools+system prefix was 3317 tokens, and the very first live run showed exactly what the docs warn about:
+
+```
+usage: input=3317 cache_write=0 cache_read=0 output=152
+```
+
+`cache_write: 0` on a request that carries a `cache_control` marker isn't a bug report — it's silence. No error, no warning, just a cache entry that was never written because the prefix didn't clear the minimum. The fix was to write the manual at the length a real one would actually be — the "Common task patterns" and "Frequently asked questions" sections in [`07-context-management/main.ts`](../../src/07-context-management/main.ts) exist as much to clear 4096 tokens honestly as to be useful, and they're genuinely both. After that, the same first request read:
+
+```
+usage: input=3 cache_write=399 cache_read=4180 output=162
+```
+
+4180 tokens of tools+system, cached. (`cache_read` shows up on turn one here because this exact prefix had already been written seconds earlier, during the previous test run, and the default 5-minute TTL was still live — a preview of exactly the reuse this mechanism is for.)
+
+### A second breakpoint for the growing tail, and a gotcha it exposed
+
+One marker on the system prompt caches the part that never changes. The conversation itself grows every turn, so it needs its own, moving marker — the "multi-turn conversations" pattern: put a breakpoint on the last content block of the most recently appended message, and move it forward each turn rather than leaving old ones stacked up (the API allows at most 4 breakpoints per request, so accumulating one per turn would eventually hit that ceiling):
+
+```typescript
+function moveMessageBreakpoint(messages: Anthropic.MessageParam[]): void {
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (typeof block === "object" && "cache_control" in block) {
+        delete block.cache_control;
+      }
+    }
+  }
+  const last = messages[messages.length - 1];
+  if (!last || !Array.isArray(last.content) || last.content.length === 0) return;
+  const lastBlock = last.content[last.content.length - 1];
+  if (typeof lastBlock === "object") {
+    (lastBlock as { cache_control?: Anthropic.CacheControlEphemeral }).cache_control = { type: "ephemeral" };
+  }
+}
+```
+
+Writing this exposed a second, unrelated gotcha: `cache_control` lives on a content *block*, not on a message. Wrangler's very first user message was written the way every prior module wrote one — `{ role: "user", content: TASK }`, a plain string — and a plain string has no block to attach a marker to. `moveMessageBreakpoint`'s `Array.isArray(last.content)` check quietly returned early for it, every time, and that message's tokens never got cached at all. The fix was mechanical once found: construct it as a one-block array instead —
+
+```typescript
+let messages: Anthropic.MessageParam[] = [{ role: "user", content: [{ type: "text", text: TASK }] }];
+```
+
+— and the same fix applies to the message compaction produces further down. Nothing about this raised an error at any point; it just meant fewer tokens were ever eligible for a cache hit than intended. It's the same shape of lesson as Module 5's leaked citation fragment and Module 6's beta-type mismatch: the API does exactly what you told it, and "what you told it" is worth checking against real `usage` numbers, not just against what compiles.
+
+### Summarizing old tool results, with a way back
+
+A tool result is often only useful for the one or two turns immediately after it arrives — once Wrangler has read a file and acted on it, the raw bytes rarely matter again. Keeping every one in full forever means paying to re-process file contents the model has already used and moved on from, on every subsequent turn. `trimOldToolResults` keeps only the most recent tool-result-bearing turn in full and collapses anything older to a short placeholder:
+
+```typescript
+const KEEP_RECENT_TOOL_TURNS = 1;
+
+function trimOldToolResults(messages: Anthropic.MessageParam[]): void {
+  const toolResultTurnIndices = messages
+    .map((message, index) => ({ message, index }))
+    .filter(
+      ({ message }) =>
+        message.role === "user" &&
+        Array.isArray(message.content) &&
+        message.content.some((block) => typeof block === "object" && block.type === "tool_result"),
+    )
+    .map(({ index }) => index);
+
+  const trimmableIndices = toolResultTurnIndices.slice(
+    0,
+    Math.max(0, toolResultTurnIndices.length - KEEP_RECENT_TOOL_TURNS),
+  );
+
+  for (const index of trimmableIndices) {
+    const content = messages[index]?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (typeof block !== "object" || block.type !== "tool_result") continue;
+      if (typeof block.content !== "string") continue;
+      if (block.content.startsWith("[trimmed:")) continue;
+      const original = block.content;
+      block.content = `[trimmed: ${original.length} chars omitted — call recall_tool_result({ tool_use_id: "${block.tool_use_id}" }) to retrieve the full original]`;
+      console.log(`[context] trimmed tool_result ${block.tool_use_id} (turn ${index}, ${original.length} chars)`);
+    }
+  }
+}
+```
+
+Trimming without a way back would just be lossy compression. `recall_tool_result` is the escape hatch: every result, full-length, is kept in an in-memory `Map<string, string>` for the life of the process regardless of what's visible in `messages`, and the tool lets Wrangler ask for one back by the `tool_use_id` quoted in the placeholder text. The system prompt's "On trimmed and summarized context" section is what makes this usable rather than confusing — the model needs to be told the convention exists before it can act on it correctly; without that, a trimmed placeholder is just a strange string with no explained next step.
+
+### Compaction: when the transcript itself is the problem
+
+Trimming shrinks individual results but leaves the number of turns untouched. Past some length, the transcript itself — not any one result inside it — is what needs to shrink. `maybeCompact` checks `messages.length` against a threshold and, if it's exceeded, asks the model to summarize the conversation so far, then replaces the entire array with that one summary:
+
+```typescript
+const COMPACT_THRESHOLD = 6;
+
+async function maybeCompact(
+  messages: Anthropic.MessageParam[],
+  originalTask: string,
+): Promise<Anthropic.MessageParam[]> {
+  if (messages.length <= COMPACT_THRESHOLD) return messages;
+
+  const summaryResponse = await client.messages.create({
+    model: "claude-haiku-4-5",
+    max_tokens: 300,
+    system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+    tools,
+    messages: [
+      ...messages,
+      { role: "user", content: "Summarize this conversation in under 150 words: ..." },
+    ],
+  });
+
+  const summaryText = summaryResponse.content
+    .filter((block): block is Anthropic.TextBlock => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  return [{ role: "user", content: [{ type: "text", text: `${originalTask}\n\nProgress so far...\n${summaryText}` }] }];
+}
+```
+
+This summarization call is a *fork* of the main conversation — a separate request that branches off the current transcript rather than continuing it — and it deliberately reuses the exact same `system`, `tools`, and `model` as the main loop. A fork that rebuilds any of those slightly differently misses the cache entirely; reusing them verbatim lets this one-off call read the same system+tools cache entry the main loop already paid for, instead of writing a second, parallel entry for no reason. The threshold here (6) is unrealistically low for any real task — it exists so this module's short demo actually triggers compaction instead of just describing it, the same reasoning as `KEEP_RECENT_TOOL_TURNS`.
+
+### Running it
+
+```
+cd src
+npx tsx 07-context-management/main.ts
+```
+
+The task: read three ops-log files, write a combined weekly summary highlighting two specific threads running through them, then read the summary back to confirm it was written correctly. Trimmed, real output:
+
+```
+turn 1 (tool_use): read_file × 3 (log-monday.md, log-tuesday.md, log-wednesday.md)
+  usage: input=3 cache_write=399 cache_read=4180 output=162
+
+turn 2 (tool_use): write_file({ path: "weekly-summary.md", content: "..." })
+  usage: input=7 cache_write=1154 cache_read=4579 output=1004
+  [context] trimmed tool_result <id> (turn 2, 1145 chars)   ← the 3 read_file results from turn 1
+  [context] trimmed tool_result <id> (turn 2, 1074 chars)
+  [context] trimmed tool_result <id> (turn 2, 1008 chars)
+
+turn 3 (tool_use): read_file({ path: "weekly-summary.md" })   ← verifying the write
+  usage: input=6 cache_write=1444 cache_read=4579 output=67
+  [context] messages.length=7 > 6 — compacting transcript
+  [context] summary (254 output tokens): "Task Summary — Read three ops logs ... weekly-summary.md
+    was written and verified to contain all required information."
+
+turn 4 (tool_use): read_file({ path: "weekly-summary.md" })   ← re-verifying, from the compacted summary
+  usage: input=3 cache_write=665 cache_read=4180 output=98
+
+turn 5 (end_turn): "Confirmed! The weekly-summary.md file has been successfully written
+  and verified. It contains: 1. NOTIF-482 Memory Leak — Complete timeline... 2. Checkout-API
+  Incident Pattern..."
+  usage: input=6 cache_write=1007 cache_read=4845 output=216
+```
+
+The `usage` line on every turn is the real evidence, and it tells three separate stories once you know where to look. **Turns 1→2→3**, `cache_read` climbs from 4180 to 4579 and holds — the tools+system entry plus the cached first user turn keep getting reused, exactly the "healthy loop" signature (reads grow or hold steady, writes cover only what's new). **Turn 3→4** is the trim-versus-cache interaction: trimming turn 1's tool results changed bytes at the exact position of turn 2's message-level breakpoint, so that specific cache entry missed — but `cache_read` only drops back to 4180, not to zero, because the *system+tools* breakpoint sits upstream of any message content and trimming never touches it. That split is exactly what the API's own invalidation rules predict: editing message content invalidates the messages-tier cache and leaves the tools/system tier alone. **Turn 4→5** shows the compacted message itself re-entering the cache pipeline — `cache_read` rises to 4845 (4180 + the 665 written for the compacted message on turn 4), confirming the plain-string-to-block-array fix actually worked, not just that it type-checked.
+
+Four things worth carrying forward:
+
+- **A cache marker with no error is not proof of a cache hit.** The minimum prefix length is model-specific and silent on failure — `cache_write: 0` and `cache_read: 0` on every request is the only symptom. Check `usage`, not just that the request succeeded.
+- **`cache_control` lives on a block, not a message.** A message built as a plain string, the way every earlier module in this course built its very first user turn, has no block to attach a marker to. If a message needs to be cache-eligible, give it array-of-blocks content from the start.
+- **Trimming and caching aren't independent — they share the same bytes.** Collapsing an old tool result changes content that a previous cache breakpoint may have been positioned on top of. That's an acceptable, even expected, cost — the API's invalidation tiers are specifically designed so it only costs the messages-tier cache, not the much larger tools+system one.
+- **A compaction call is a fork, and forks must match their parent's prefix exactly.** Reusing the same `system`, `tools`, and `model` for the summarization request isn't a style preference — it's what lets that one-off call read the cache the main loop already built instead of paying to rebuild it.
+
+Wrangler can now run for a long time without its own transcript becoming the bottleneck. What it still can't do is remember anything once the process exits — every module so far has lived and died with a single `npx tsx` invocation. Module 8 is memory: giving Wrangler a way to carry facts, preferences, and progress across separate runs, not just across turns within one.
