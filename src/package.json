@@ -1,0 +1,22 @@
+{
+  "name": "building-agents",
+  "version": "1.0.0",
+  "description": "Code examples for the course, referenced from the [docs site](../docs/).",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "01": "tsx 01-first-call/main.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.125.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}

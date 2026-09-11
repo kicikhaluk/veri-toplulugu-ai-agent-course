@@ -71,7 +71,7 @@ Bir e-ticaret platformunda "iade süreci" için iş gereksinimleri (business req
 
 Modele amacı tarif ettikten sonra, tam olarak istediğimiz formatı/üslubu gösteren **tek bir örnek** vermektir. Model bu örneği referans alarak yeni bir çıktı üretir.
 
-**Ne zaman kullanılır?** Format veya üslup önemli olduğunda ama tek bir örneğin yeterli olacağı, görevin çok karmaşık olmadığı durumlarda kullanılır.
+Format veya üslup önemli olduğunda ama tek bir örneğin yeterli olacağı, görevin çok karmaşık olmadığı durumlarda kullanılır.
 
 **Örnek — QA Engineer/Tester:**
 
