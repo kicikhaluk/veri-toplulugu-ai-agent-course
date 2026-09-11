@@ -1,0 +1,4 @@
+Module 3 demo workspace.
+
+This file exists so the agent has something real to read. Nothing
+special about the content — the point is the tool that reads it.

@@ -309,3 +309,209 @@ Five things worth reading out of that structure directly, since you can now see 
 - **The loop ran three round trips**, not one: multiply × 2 → add → final answer. This is why it's a `while (true)`, not an `if`. A tool-using turn is not the end of the conversation; it's Claude asking for information before it can finish the conversation. `messages` ends up six entries long — your question, three assistant turns, and two `tool_result` replies — and every entry stays in the array, resent in full, for the life of the loop.
 
 Everything else in this course is this same shape: a `while` loop, a `tools` array, a dispatcher. Module 3 replaces the toy calculator with filesystem tools that touch real files on disk — which is also where "trust the model's input" stops being good enough.
+
+## Module 3 — Filesystem tools and a sandbox guard
+
+The loop from Module 2 doesn't change at all here. What changes is what's inside the `tools` array and the `executeTool` dispatcher — and, for the first time, a tool input that names a path is something you have to actively defend against, not just cast and trust.
+
+`calculate` could never do damage: worst case it returns the wrong number. A `read_file`/`write_file` tool can be asked — by an adversarial prompt, or just a confused user typing a bad relative path — to touch a file well outside where you meant to let the agent operate. So Module 3 introduces the pattern every filesystem tool in this course uses from here on: **confine every path to a workspace root, and resolve every model-supplied path through one guard function before it ever reaches `fs`.**
+
+### The sandbox root and the guard
+
+```typescript
+import * as path from "node:path";
+
+// Everything the model touches is confined to this directory. No tool below
+// ever uses a path the model gives us without resolving it through
+// resolveSafePath() first.
+const workspaceRoot = path.resolve(import.meta.dirname, "workspace");
+
+function resolveSafePath(relativePath: string): string {
+  const target = path.resolve(workspaceRoot, relativePath);
+  if (target !== workspaceRoot && !target.startsWith(workspaceRoot + path.sep)) {
+    throw new Error(`"${relativePath}" resolves outside the workspace root — refusing.`);
+  }
+  return target;
+}
+```
+
+`import.meta.dirname` is the ESM replacement for the `__dirname` you don't have in a `"type": "module"` project — it's the directory of the current file, available without any `fileURLToPath` boilerplate.
+
+The guard itself is the whole trick: resolve the model's path *against* the root with `path.resolve`, then check the result still starts with the root. `path.resolve("workspace", "../secrets.txt")` doesn't stay inside `workspace` — that's exactly the case the `startsWith` check catches. Every one of the four tools below calls `resolveSafePath` before touching disk; none of them do their own path math.
+
+### Real input validation, not a cast
+
+Module 2 cast `tool_use.input` straight to the shape it expected and left it there as a deferred problem. Now that a bad shape can mean writing to the wrong file, that cast is replaced with an actual runtime check:
+
+```typescript
+function expectString(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`Expected "${field}" to be a string, got ${typeof value}`);
+  }
+  return value;
+}
+```
+
+Every tool function reads its fields through `expectString` (or a sibling you'd write for other types) instead of destructuring and hoping. It's a small function, but it's the difference between "the model sent a malformed `tool_use.input`" failing loudly, right at the boundary, versus failing confusingly three lines into a filesystem call.
+
+### Four tools, one dispatcher, errors reported — not thrown
+
+```typescript
+const tools: Anthropic.Tool[] = [
+  {
+    name: "list_dir",
+    description: "List the files and directories at a path inside the workspace. Use \".\" for the workspace root.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Directory to list, relative to the workspace root." },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "read_file",
+    description: "Read the full text contents of a file inside the workspace.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File to read, relative to the workspace root." },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "write_file",
+    description: "Create a file inside the workspace, or overwrite it if it already exists. Creates parent directories as needed.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File to write, relative to the workspace root." },
+        content: { type: "string", description: "The full contents to write." },
+      },
+      required: ["path", "content"],
+    },
+  },
+  {
+    name: "edit",
+    description:
+      "Replace one exact occurrence of old_str with new_str in an existing file. old_str must match exactly, including whitespace, and must be unique in the file — include enough surrounding context to make it so.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File to edit, relative to the workspace root." },
+        old_str: { type: "string", description: "Exact text to find. Must occur exactly once in the file." },
+        new_str: { type: "string", description: "Text to replace it with." },
+      },
+      required: ["path", "old_str", "new_str"],
+    },
+  },
+];
+```
+
+`edit` is deliberately modeled on the find-and-replace tool Claude Code itself uses: `old_str` must match exactly once. That uniqueness requirement isn't pedantry — it's what makes an edit safe to apply without the model (or you) re-reading the whole file to confirm which occurrence it meant.
+
+The tool implementations (`list_dir`, `read_file`, `write_file`, `edit`) are unsurprising once you've seen the guard — each pulls its path through `resolveSafePath`, does one `node:fs/promises` call, and returns a string. `edit` is the only one with real logic: count occurrences of `old_str` with `original.split(oldStr).length - 1`, and refuse to proceed unless that count is exactly 1.
+
+What's new is the dispatcher. Filesystem calls fail for mundane reasons — a missing file, a guard rejection, a non-unique `old_str` — and those failures are information the model can act on, not a reason to crash the loop:
+
+```typescript
+async function executeTool(name: string, input: unknown): Promise<{ content: string; isError: boolean }> {
+  try {
+    switch (name) {
+      case "list_dir":
+        return { content: await listDir(input), isError: false };
+      case "read_file":
+        return { content: await readFileTool(input), isError: false };
+      case "write_file":
+        return { content: await writeFileTool(input), isError: false };
+      case "edit":
+        return { content: await editFile(input), isError: false };
+      default:
+        return { content: `Error: no such tool "${name}"`, isError: true };
+    }
+  } catch (err) {
+    return { content: err instanceof Error ? err.message : String(err), isError: true };
+  }
+}
+```
+
+And the one change to the loop itself — `tool_result` blocks carry a real `is_error` field in the API, and now we set it:
+
+```typescript
+const toolResults: Anthropic.ToolResultBlockParam[] = [];
+for (const block of toolUseBlocks) {
+  const { content, isError } = await executeTool(block.name, block.input);
+  toolResults.push({
+    type: "tool_result",
+    tool_use_id: block.id,
+    content,
+    is_error: isError,
+  });
+}
+```
+
+`is_error: true` doesn't stop the loop or throw on your side — it's a signal *to Claude* that this particular result is a failure, so it can read the message and decide what to do next (try a different path, ask you, give up gracefully) instead of misreading an error string as a normal result.
+
+This is `src/03-filesystem/main.ts` in full, working against a small sandbox at `src/03-filesystem/workspace/` (a `notes.txt` and a `todo.md` are seeded there for the demo). Run it:
+
+```bash
+cd src
+npx tsx 03-filesystem/main.ts
+```
+
+### Watching the guard actually trip
+
+The demo prompt asks the agent to list the workspace, read `notes.txt`, edit `todo.md`, and then — "just to see what happens" — read `../secrets.txt`, a file that sits one level *above* the workspace root (and exists, so a block here is provably the guard, not a missing-file error). Real output, trimmed to the interesting parts:
+
+```
+=== response ===   (first turn: list_dir + read_file, run in parallel)
+content: [
+  { type: 'text', text: "I'll help you with that. Let me start by listing the workspace contents and reading notes.txt." },
+  { type: 'tool_use', name: 'list_dir', input: { path: '.' }, ... },
+  { type: 'tool_use', name: 'read_file', input: { path: 'notes.txt' }, ... }
+]
+stop_reason: 'tool_use'
+```
+
+...a second round trip reads `todo.md` to find the right insertion point, then the third round trip is the one worth reading in full:
+
+```
+=== response ===
+content: [
+  { type: 'text', text: 'Perfect! Now I'll add the new line after "- Write filesystem tools" and then try to read ../secrets.txt.' },
+  {
+    type: 'tool_use',
+    name: 'edit',
+    input: {
+      path: 'todo.md',
+      old_str: '- Set up the loop\n- Write filesystem tools',
+      new_str: '- Set up the loop\n- Write filesystem tools\n- Ship module 3'
+    }
+  },
+  { type: 'tool_use', name: 'read_file', input: { path: '../secrets.txt' } }
+]
+stop_reason: 'tool_use'
+
+=== tool_result(s) sent back ===
+[
+  { type: 'tool_result', tool_use_id: '...', content: 'Replaced 1 occurrence in todo.md', is_error: false },
+  {
+    type: 'tool_result',
+    tool_use_id: '...',
+    content: '"../secrets.txt" resolves outside the workspace root — refusing.',
+    is_error: true
+  }
+]
+```
+
+Claude batched the edit and the boundary-crossing read into the same turn — it had no way to know one would fail. The guard did exactly its job: `read_file` never touched `fs` for that path at all, `resolveSafePath` threw first, and the error came back as a normal `tool_result` with `is_error: true`. The final turn (`stop_reason: 'end_turn'`) has Claude reporting the refusal back to you in plain language, unprompted, because that's what a failed tool call sitting in its context looks like from the model's side. Run it yourself to see the exact IDs and the full first exchange.
+
+Four things worth carrying forward from this module:
+
+- **The guard lives in exactly one function.** Every tool routes through `resolveSafePath` — there's one place to audit, not four. When Module 4 adds a `bash` tool with real command execution, this is the pattern that gets reused, not reinvented.
+- **A rejected path is not an exception you let crash the loop.** It's a `tool_result` with `is_error: true`, same shape as a successful one, sent back so the model can react to it in-conversation.
+- **Runtime input validation stopped being optional.** `expectString` is trivial, but it's the boundary where "arbitrary JSON from the model" becomes "a string you can safely hand to `path.resolve`."
+- **The model didn't need to be told not to try `../secrets.txt` — it tried anyway, because you told it to ("just to see what happens").** In a real agent, that curiosity doesn't announce itself as a test; it shows up as an ordinary-looking path that happens to walk out of bounds. The guard has to hold regardless of whether the model's intent was adversarial or completely innocent.
+
+Module 4 keeps the same guard and the same `is_error` pattern, and adds the tools that make an agent feel genuinely useful on a real project: a search/grep tool, and a `bash` tool gated behind an allowlist — which is also where parallel tool use stops being a curiosity and starts being something you have to actively think about.
