@@ -121,3 +121,202 @@ Devam etmeden önce aşağıdakilere bir göz atmakta/değinmekte fayda var:
 - **`system`, `messages`'dan ayrıdır.** Modele verdiğiniz sabit talimattır.
 
 Kullanıcı mesajını değiştirip tekrar çalıştırmayı deneyin — çalıştırmalar arasında hiçbir state'in taşınmadığını fark edeceksiniz. Bir sonraki modülde bu geçmişi turlar arasında kalıcı hale getirip ilk tool'u ekleyeceğiz; bu da bu tek seferlik çağrıyı bir agent loop'unun başlangıcına dönüştürecek.
+
+## Modül 2 — Loop, v0
+
+Bu, en önemli modül. Buradan sonraki her şey, dosya sistemi erişimi, web'de arama, guardrails, evals, bu bölümde yazacağımız loop'a entegre edeceğiz. Loop'un genel hatları belli olup sadece erişebileceği araçlar çeşitlenecek.
+
+### Tool Yapısı
+
+Tool isim, açıklama ve girdisinin belirtildiği bir JSON Schema'dan oluşur. Claude hiçbir şeyi kendisi çalıştırmaz. Sadece bir tool'u çağırmak için `tool_use` content bloğu şeklinde bir *istek* üretir. Bu isteği onaylayıp onaylamayacağınıza, onaylarsanız nasıl çalıştıracağınıza kodunuz karar verir.
+
+```typescript
+const tools: Anthropic.Tool[] = [
+  {
+    name: "calculate",
+    description:
+      "Evaluate a single arithmetic operation between two numbers. Call this for any arithmetic you need an exact answer for — never compute it yourself.",
+    input_schema: {
+      type: "object",
+      properties: {
+        operation: {
+          type: "string",
+          enum: ["add", "subtract", "multiply", "divide"],
+          description: "The operation to perform.",
+        },
+        a: { type: "number", description: "The first operand." },
+        b: { type: "number", description: "The second operand." },
+      },
+      required: ["operation", "a", "b"],
+    },
+  },
+];
+```
+
+`description` alanı önemli. Claude, bir tool'u *çağırıp çağırmayacağına* neredeyse tamamen bu metne bakarak karar verir. Bu yüzden sadece ne yaptığını değil, *ne zaman* çağrılması gerektiğini de ("never compute it yourself") açıkça yazmakta fayda var. Belirsiz açıklamalar, modelin kullanması gereken tool'u atlamasının en yaygın sebebidir.
+
+### Durma sinyali: `stop_reason`
+
+Her response bir `stop_reason` taşır. Sürekli karşımıza çıkacak iki tanesi:
+
+| `stop_reason` | Anlamı | Ne yapmalısınız |
+| --- | --- | --- |
+| `tool_use` | Claude en az bir `tool_use` bloğu üretir ve devam etmeden önce sonucunu ister | Tool'(lar)ı çalıştırıp, sonuçlar ile modeli geri besleyip, loop'u tekrarlamamız gerekir |
+| `end_turn` | Claude işini bitirdiği sinyal. Bekleyen bir tool çağrısı yok | Son metni yazdırırız |
+
+(`max_tokens`, `pause_turn`, `refusal` gibi başka alanalarda var. Daha uzun çalışmalara ve sunucu taraflı tool'lara geçtiğimizde önem kazanacaklar. Sırası geldikçe onlara da değineceğiz.)
+
+### Loop
+
+```typescript
+const messages: Anthropic.MessageParam[] = [
+  {
+    role: "user",
+    content:
+      "A workshop has 14 tables. Eleven of them seat 6 people each, and the remaining 3 seat only 4 people each. How many people can the workshop seat in total?",
+  },
+];
+
+while (true) {
+  const response = await client.messages.create({
+    model: "claude-haiku-4-5",
+    max_tokens: 1024,
+    tools,
+    messages,
+  });
+
+  // Log the raw response so that we can see the actual shape the API returns
+  // id, model, stop_reason, usage, and the content block array — not just
+  // the parts we bother to summarize.
+  console.log("\n=== response ===");
+  console.dir(response, { depth: null });
+
+  // Always append the FULL response.content, not just the text — the
+  // tool_use blocks inside it are what let the next tool_result line up.
+  messages.push({ role: "assistant", content: response.content });
+
+  if (response.stop_reason !== "tool_use") {
+    break;
+  }
+
+  const toolUseBlocks = response.content.filter(
+    (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
+  );
+
+  const toolResults: Anthropic.ToolResultBlockParam[] = [];
+  for (const block of toolUseBlocks) {
+    const result = await executeTool(block.name, block.input);
+    toolResults.push({
+      type: "tool_result",
+      tool_use_id: block.id,
+      content: result,
+    });
+  }
+
+  // And the other half of the round trip: exactly what we send back.
+  console.log("\n=== tool_result(s) sent back ===");
+  console.dir(toolResults, { depth: null });
+
+  // All tool_result blocks go back in a single user message.
+  messages.push({ role: "user", content: toolResults });
+}
+```
+
+`executeTool`, dispatcher görevi görür — tool ismine göre bir `switch` yapıp ilgili fonksiyonu çağırır ve bir string döner:
+
+```typescript
+function calculate(input: { operation: string; a: number; b: number }): string {
+  const { operation, a, b } = input;
+  switch (operation) {
+    case "add":
+      return String(a + b);
+    case "subtract":
+      return String(a - b);
+    case "multiply":
+      return String(a * b);
+    case "divide":
+      return b === 0 ? "Error: division by zero" : String(a / b);
+    default:
+      return `Error: unknown operation "${operation}"`;
+  }
+}
+
+async function executeTool(name: string, input: unknown): Promise<string> {
+  switch (name) {
+    case "calculate":
+      return calculate(input as { operation: string; a: number; b: number });
+    default:
+      return `Error: no such tool "${name}"`;
+  }
+}
+```
+
+`input: unknown` kısmına dikkat etmemiz gerekir — TypeScript açısından modelin `tool_use.input`'u rastgele bir JSON'dur. Burada kısalık olsun diye direkt cast ediyoruz; Modül 3'ten itibaren, tool girdileri *hangi dosyaya dokunulacağını* seçmeye başladığında, direkt cast etmek yerine önce tipi doğrulayacağız.
+
+Bu kodun tamamı `src/02-loop-v0/main.ts` içinde. Çalıştırmak için:
+
+```bash
+cd src
+npx tsx 02-loop-v0/main.ts
+```
+
+Bilinçli olarak derli toplu bir özet yerine bütün `response` objesini (`console.dir(response, { depth: null })`) yazdırıyoruz — bu aşamada, API'nin size gerçekte ne döndürdüğünü görmek, düzgün bir log satırından çok daha değerli. İlk iterasyon, hiç düzenlenmemiş haliyle (response farklılık gösterebilir):
+
+```
+=== response ===
+{
+  model: 'claude-haiku-4-5-20251001',
+  id: 'msg_011CexM83ma3axXbhUwASpGJ',
+  type: 'message',
+  role: 'assistant',
+  content: [
+    {
+      type: 'text',
+      text: 'I need to calculate the total seating capacity of the workshop.'
+    },
+    {
+      type: 'tool_use',
+      id: 'toolu_01HvkhVJapntMq7n7bVXTiaT',
+      name: 'calculate',
+      input: { operation: 'multiply', a: 11, b: 6 },
+      caller: { type: 'direct' }
+    },
+    {
+      type: 'tool_use',
+      id: 'toolu_017HMgBzNxFmV21Cf1pXitpU',
+      name: 'calculate',
+      input: { operation: 'multiply', a: 3, b: 4 },
+      caller: { type: 'direct' }
+    }
+  ],
+  container: null,
+  stop_reason: 'tool_use',
+  stop_sequence: null,
+  stop_details: null,
+  usage: {
+    input_tokens: 690,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    output_tokens: 167,
+    service_tier: 'standard'
+  }
+}
+
+=== tool_result(s) sent back ===
+[
+  { type: 'tool_result', tool_use_id: 'toolu_01HvkhVJapntMq7n7bVXTiaT', content: '66' },
+  { type: 'tool_result', tool_use_id: 'toolu_017HMgBzNxFmV21Cf1pXitpU', content: '12' }
+]
+```
+
+...ardından `add` işlemi için ikinci bir `response`/`tool_result` çifti, en sonda da hiç `tool_use` bloğu içermeyen, sadece kapanış metnini taşıyan, `stop_reason: 'end_turn'` olan bir `response` gelecek. Üçünü de tam haliyle görmek için çalıştırın. Buradaki metinden çok, gerçek çıktıyı bir kez baştan sona incelemenizde daha fazla yarar var.
+
+Artık bu yapıdan doğrudan okuyabileceğimiz, bir varsayım olarak kabul etmek yerine gözlemleyebileceğimiz beş şey var:
+
+- **`content` bir array'dir ve bir `tool_use` bloğu, bir `text` bloğunu ile birlikte.** Claude hem kendini açıkladı ("I need to calculate...") hem de aynı turda tool'u çağırdı. Text ve tool çağrıları aynı array içinde birbirinin alternatifi değiller.
+- **Claude, tool'u tek bir turda iki kez çağırdı.** Her iki çarpma işlemi de tek bir response içinde iki ayrı `tool_use` bloğu olarak geldi. Bu, varsayılan olarak açık olan paralel tool kullanımıdır. İki sonuç da iki ayrı mesaj olarak değil, iki `tool_result` bloğu içeren tek bir `user` mesajı olarak geri gönderildi. Bunları ayrı mesajlara bölmek, modeli sessizce çağrıları toplu yapmayı bırakmaya "eğiten" yaygın bir hatadır.
+- **Her `tool_use` bloğu kendi `id`'sini taşır ve eşleşen `tool_result`, bunu `tool_use_id` olarak geri yansıtır.** Bir sonucu, onu tetikleyen çağrıya bağlayan tek şey budur — sırada ya da konumda bağlayıcı hiçbir şey yok, bağlayan şey `id`'dir.
+- **`usage`, kümülatif değil, istek başınadır** ve her turda büyür (690 → 918 → 1026 input token) çünkü *tüm* geçmiş — az önce gördüğünüz tool çağrıları ve sonuçları da dahil — her seferinde yeniden gönderilir. Bu, Modül 7'nin (context yönetimi) neden var olduğuna dair ilk somut ipucu: sınırsız bir loop, sınırsızca büyüyen bir input maliyeti demektir.
+- **Loop, tek değil üç round trip çalıştı**: çarpma × 2 → toplama → son cevap. `if` değil de `while (true)` kullanmamızın sebebi de bu. Tool kullanan bir tur, konuşmanın sonu değildir; Claude'un konuşmayı bitirebilmek için bilgi istemesidir. `messages` sonunda altı öğe uzunluğuna ulaşır — sorunuz, üç asistan turu ve iki `tool_result` cevabı — ve her öğe, loop yaşadığı sürece array içinde kalıp her seferinde tam olarak yeniden gönderilir.
+
+Bu kursun geri kalanı da aynı şekle sahip: bir `while` loop'u, bir `tools` array'i, bir dispatcher. Modül 3 de, hesap makinesinin yerine gerçek dosyalara dokunan dosya sistemi tool'larını göreceğiz ve "modelin girdisine güven" yaklaşımının artık yetmemeye başladığı yer de tam olarak burası.
