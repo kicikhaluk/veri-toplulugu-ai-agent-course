@@ -1244,3 +1244,151 @@ Three things worth carrying forward:
 - **Don't trust the model's narration over the actual record.** The dry-run run's false claim of having deleted files is a small example of a general rule: the audit log and the filesystem are ground truth; a model's summary of what it did is not evidence of what it did.
 
 Wrangler can now hold a conversation, use tools, manage context, remember things across sessions, and stop itself in front of anything risky until a human says go. The one thing missing is a way to know, systematically, whether any of this actually works well — every check so far has been "I ran it once and read the transcript." Module 10 is evals: turning that manual reading into small, repeatable checks that catch a regression before a human has to notice one by hand.
+
+## Module 10 — Evals: single-step checks and full-run scoring
+
+Everything up to this point has been verified the same way: run it once, read the transcript, decide by eye whether it looks right. That doesn't scale — it catches nothing the next time a prompt, a tool description, or a model version changes. Module 10 turns that manual reading into code, in `src/10-evals/`.
+
+There are two genuinely different questions to ask about an agent, and they need two different kinds of eval:
+
+- **Does Claude pick the right tool, right now?** A single API call, no execution, no loop — cheap enough to run on every change. `10-evals/tool-selection.ts`.
+- **Did the whole run produce a good outcome?** The full agentic loop, end to end, scored against both mechanical checks and human-grade judgment. `10-evals/task-eval.ts`.
+
+### Single-step: does Claude pick the right tool
+
+Each case is one isolated `messages.create()` call against the same five tool schemas from module 9 — nothing gets executed, we only look at the `tool_use` block Claude produces (or doesn't) and check it against an expectation:
+
+```typescript
+type EvalCase = {
+  id: string;
+  note: string;
+  messages: Anthropic.MessageParam[];
+  expectedTool?: string; // undefined means "no tool call is correct"
+  checkInput?: (input: Record<string, unknown>) => boolean;
+};
+```
+
+A case doesn't have to be a bare first turn. `merge-with-prior-context` primes the conversation with `tool_use`/`tool_result` blocks as if both drafts had already been read — the way the conversation actually looks mid-task — then checks that "merge those into merged.md" produces a `write_file` call whose `content` genuinely reflects both sources:
+
+```typescript
+checkInput: (input) =>
+  input.path === "merged.md" &&
+  typeof input.content === "string" &&
+  /retry buffer/i.test(input.content) &&
+  /(11:15|18:02|timeline)/i.test(input.content),
+```
+
+And one case, `no-tool-needed`, expects *no* tool call at all — a question like "what makes a good incident-retro write-up?" shouldn't touch the filesystem. Overusing tools is as real a failure mode as picking the wrong one, so it gets its own case rather than being assumed away.
+
+Running it live against all six cases:
+
+```
+PASS  list-root — a request to see everything should pick list_dir on the workspace root
+PASS  read-specific-file — asking about one named file's contents should pick read_file, not list_dir
+PASS  write-new-file — a create-this-file request should pick write_file with the given content
+PASS  delete-explicit — an explicit delete request should pick delete_file, not edit or write_file
+PASS  merge-with-prior-context — once both drafts are already in context, 'merge them' should write merged.md with content from both
+PASS  no-tool-needed — a question that doesn't touch the workspace shouldn't trigger any tool call
+
+6/6 tool-selection cases passed.
+```
+
+### Full-run: did the outcome actually work
+
+Tool selection alone doesn't tell you whether a multi-turn task actually finished in a good state — that needs the real loop, run to completion, in a disposable workspace:
+
+```typescript
+async function runAgentToCompletion(root: string, task: string, maxTurns = 8): Promise<string> {
+  const messages: Anthropic.MessageParam[] = [{ role: "user", content: [{ type: "text", text: task }] }];
+  for (let turn = 0; turn < maxTurns; turn++) {
+    const response = await client.messages.create({ model: "claude-haiku-4-5", max_tokens: 1024, tools, messages });
+    messages.push({ role: "assistant", content: response.content });
+    if (response.stop_reason !== "tool_use") { /* ...return final text... */ }
+    // ...execute each tool_use block directly, no guardrails, no confirmation...
+  }
+  return "(hit max turn cap without the model stopping — treating as incomplete)";
+}
+```
+
+Two things are deliberately different from module 9's loop. There's no `runGuarded()` — evals run unattended, with nobody at a keyboard to type "y" — and `maxTurns` is the safety net that replaces human confirmation: an agent that never converges fails the eval instead of looping forever.
+
+Each scenario copies a fixture pair of draft files into a fresh temp directory, runs the merge-and-delete task against it, then grades the result two ways:
+
+- **Code checks** — cheap, deterministic, no model involved: does `merged.md` exist, are the two drafts actually gone, does the merged text contain specific facts pulled from each source.
+- **A grader call** — for the part that's actually about judgment, forced through a tool so the score comes back structured instead of parsed out of prose:
+
+```typescript
+const graderTool: Anthropic.Tool = {
+  name: "submit_grade",
+  input_schema: {
+    type: "object",
+    properties: {
+      score: { type: "integer", description: "1 (fails the rubric) to 5 (fully meets it)" },
+      passed: { type: "boolean" },
+      reasoning: { type: "string" },
+    },
+    required: ["score", "passed", "reasoning"],
+  },
+};
+// called with tool_choice: { type: "tool", name: "submit_grade" }
+```
+
+On the standard scenario — the same NOTIF-482 drafts from module 9 — both layers agree it worked:
+
+```
+=== scenario: standard-merge ===
+  [code check] PASS  merged.md exists
+  [code check] PASS  draft-a.md deleted
+  [code check] PASS  draft-b.md deleted
+  [code check] PASS  covers root-cause detail from draft-a
+  [code check] PASS  covers timeline detail from draft-b
+  [grader]     score=5/5  passed=true
+  [grader]     The merged document excellently preserves all substantial content from both source
+  drafts without duplication. It cleanly integrates Priya's technical observations [...] with
+  Marcus's timeline and follow-ups into a well-organized final retro document [...]
+```
+
+### A conflict scenario, and eval variance as a real finding
+
+The interesting eval isn't the one that always passes. `fixtures/conflict/` is a second, harder scenario: two drafts about the same fictional incident (PAY-119) that **genuinely disagree** about the root cause — Sana's notes blame connection-pool exhaustion, Devrim's blame an unbounded retry backoff hammering a degraded upstream. The task prompt is identical to the standard scenario's; the rubric asks something different: does the merge surface that the sources disagree, rather than silently picking one account or blending them into something neither draft actually said.
+
+Running this scenario twice, live, produced two different verdicts. First run:
+
+```
+[grader]     score=2/5  passed=false
+[grader]     [...] treats them as complementary factors rather than explicitly calling out the
+fundamental disagreement between the drafts. Sana identifies connection-pool exhaustion as THE
+root cause, while Devrim identifies unbounded retry backoff as THE root cause—the merged version
+conflates them into "exacerbated by" language that obscures which engineer's analysis was correct
+[...] A human reader cannot clearly see the disagreement to resolve it.
+```
+
+Second run, same fixtures, same task, same rubric:
+
+```
+[grader]     score=4/5  passed=true
+[grader]     The merged document explicitly surfaces the disagreement by structuring it as "Primary
+Issue" vs "Contributing Factor" under Root Cause Analysis, making the competing accounts clearly
+visible. However, it presents them as simultaneous rather than exploring whether one actually
+caused the other, which leaves some interpretive ambiguity about their relationship.
+```
+
+Both the merge itself and the grading of it varied between runs of the exact same scenario — one run produced a merge that genuinely buried the disagreement, the other produced one that structurally called it out. That's not a bug in the eval harness; it's what running a non-deterministic model twice actually looks like. The practical consequence: a single pass/fail from an LLM-graded scenario is a sample, not a verdict. For a scenario that matters, run it several times and look at the pass rate, or treat one failure as "worth a closer look" rather than "broken" — exactly the way you'd treat a single flaky test in any other test suite, except here the flakiness is coming from the thing under test itself, not the test infrastructure.
+
+### Running it
+
+```
+cd src
+npx tsx 10-evals/tool-selection.ts   # 6 single-step cases, ~seconds
+npx tsx 10-evals/task-eval.ts        # 2 full-run scenarios, a bit slower and pricier
+```
+
+Both scripts set `process.exitCode = 1` on any failure, so they plug into a CI step (`npm run 10:tools && npm run 10:tasks`) the same way any other test command would.
+
+Three things worth carrying forward:
+
+- **Keep deterministic checks and judgment calls separate.** Code checks (file exists, content matches a pattern) don't drift between runs; a grader call can. Run the cheap deterministic layer first — it's the one you can actually trust to mean the same thing tomorrow.
+- **An unattended loop needs a turn cap where a guarded one had a human.** `maxTurns` in `runAgentToCompletion` isn't a performance optimization — it's what stands in for the confirmation prompt module 9 relied on to stop a runaway loop.
+- **An eval that always passes is telling you less than one that sometimes fails.** The conflict scenario is more useful than the standard one precisely because it's the one that occasionally catches the model doing something you don't want — silently flattening a real disagreement into agreeable-sounding prose.
+
+Wrangler can now hold a conversation, use tools, manage context, remember things across sessions, guard itself against risky actions, and be checked automatically instead of by hand. Module 11 is composability: turning Wrangler from a script you run directly into something with a real CLI entry point, and something other agents can call as a tool or subagent in its own right.
