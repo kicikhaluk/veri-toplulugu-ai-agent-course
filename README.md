@@ -4,7 +4,6 @@ An educational course covering:
 
 - **Prompt Engineering and Techniques**
 - **Building an Agent from Scratch with Claude** — the agentic loop, evals, tool use
-- **AI-Native Teams** — a brief introduction
 
 ## Repo layout
 
