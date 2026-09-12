@@ -1614,3 +1614,100 @@ Three things worth carrying forward:
 - **Guardrails don't disappear when an agent goes headless, they change shape.** A human confirmation prompt only works when a human is there to answer it; a subagent needs its risk policy decided in advance, not asked for at runtime.
 
 Wrangler now runs from the command line, checks itself automatically, and can be called by another agent as a black box. Module 12 closes out the course: where Wrangler's hand-rolled loop sits next to the Tool Runner, the Claude Agent SDK, and Managed Agents — and when reaching for one of those beats building the loop yourself.
+
+## Module 12 — Where to go next
+
+Every module in this course wrote the same `while (stop_reason === "tool_use")` loop by hand, once per idea: tools, then a sandbox, then search and bash, then server tools, MCP, context management, memory, guardrails, evals, composability. That was deliberate — the loop is small enough to hold in your head, and building it yourself is what makes every abstraction below legible instead of magic. But Anthropic ships three narrower and broader options that remove parts of that loop-writing work, and knowing when each one is the better call is the last thing worth teaching.
+
+This module has no new code in `src/` — unlike every prior module, there's nothing here to run against the real API. It's a map of the territory, not a feature to build, so the snippets below are illustrative reference shapes pulled from Anthropic's own docs, not files in this repo.
+
+### Option 1: Tool Runner — the same loop, as an SDK helper
+
+`client.beta.messages.toolRunner()` is the loop this course wrote by hand, collapsed into one call. You still define your own tools and own their execution — nothing about *what* Wrangler can do changes — but the SDK drives the request → execute → feed-results-back cycle instead of `wrangler.ts`'s `for` loop:
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
+import { z } from "zod";
+
+const client = new Anthropic();
+
+const readFile = betaZodTool({
+  name: "read_file",
+  description: "Read the full text contents of a file inside the workspace.",
+  inputSchema: z.object({ path: z.string() }),
+  run: async (input) => await fs.readFile(resolveSafePath(input.path), "utf-8"),
+});
+
+const finalMessage = await client.beta.messages.toolRunner({
+  model: "claude-haiku-4-5",
+  max_tokens: 1024,
+  tools: [readFile /* , writeFile, editFile, deleteFile, listDir */],
+  messages: [{ role: "user", content: task }],
+});
+```
+
+Two things worth naming because this course built them by hand:
+
+- **Human-in-the-loop approval doesn't need a manual loop.** Module 9's `runGuarded()` wrapped every tool call in a risk-tier check before it ran. The Tool Runner gives you the same gate two ways: return a "declined" result from inside a tool's own `run()` function, or inspect the pending `tool_use` block between iterations and override it with `setMessagesParams()` before the runner executes it.
+- **It's beta, and it has a real sharp edge.** As of `@anthropic-ai/sdk` 0.110.0, the runner doesn't auto-resume a turn that stops with `stop_reason: "pause_turn"` (which a long server-tool turn — like the web search from module 5 — can trigger). A paused turn just ends the loop silently unless you check `stop_reason` yourself and push the paused turn back in. The manual loop this course wrote never had that gap, because it checks `stop_reason` explicitly every turn already.
+
+Reach for it when you want your own tools without hand-writing the loop — which is most of what modules 1–9 did. Reach for the manual loop instead when you need a custom transport, request shapes the runner can't build, or you'd rather not take a beta dependency.
+
+### Option 2: Claude Agent SDK — Claude Code, as a library
+
+This is a different product, not a bigger Tool Runner. `@anthropic-ai/claude-agent-sdk` packages the actual Claude Code harness — its built-in file read/write/edit, bash, grep, and web-search tools, its own agent loop, context management, hooks, subagents, and permissions — behind one function call:
+
+```typescript
+import { query } from "@anthropic-ai/claude-agent-sdk";
+
+for await (const message of query({
+  prompt: "Merge draft-a.md and draft-b.md into merged.md, then delete the originals.",
+  options: { cwd: "./workspace", permissionMode: "default", maxTurns: 8 },
+})) {
+  console.log(message);
+}
+```
+
+Nothing in that snippet defines a tool — there's no `list_dir`/`read_file`/`write_file` schema at all, because the SDK already has them, built in. That's the entire tradeoff versus everything else in this course: Wrangler's tools were hand-written specifically so this course could show what a tool *is*; the Agent SDK is for when you want a capable filesystem-and-shell agent and don't need to author or constrain its tools yourself. Use it when the built-in toolset is roughly what you'd have built anyway — a coding agent, a repo assistant — and you'd rather not re-implement it module by module.
+
+### Option 3: Managed Agents — Anthropic hosts the loop *and* the sandbox
+
+The Tool Runner and the Agent SDK both still run in *your* process, on *your* infrastructure — you `npm install` a library and it runs where you run it. Managed Agents is the one option that isn't a library at all: you define an agent and a session over a REST API, and Anthropic runs the loop and hosts the container your tools execute in.
+
+```typescript
+// 1. Create the agent once — reusable, versioned, not per-request
+const agent = await client.beta.agents.create({
+  name: "Wrangler",
+  model: "claude-haiku-4-5",
+  tools: [{ type: "agent_toolset_20260401", default_config: { enabled: true } }],
+});
+
+// 2. Start a session against it, in its own hosted sandbox
+const session = await client.beta.sessions.create({
+  agent: { type: "agent", id: agent.id, version: agent.version },
+  environment_id: environment.id,
+});
+
+// 3. Send messages and stream events back over SSE — no loop to write at all
+await client.beta.sessions.events.send(session.id, {
+  events: [{ type: "user.message", content: [{ type: "text", text: "Merge the two drafts." }] }],
+});
+```
+
+There's no `for (turn ...)` anywhere in your own code — no loop to write, no `messages` array to grow, no context window to manage, because none of that state lives in your process. Reach for this when you want a long-running or scheduled agent, a persisted and versioned config rather than a script, or simply don't want to own the compute Wrangler's tools run on — the tradeoff is giving up the direct, in-process control every other option in this course kept.
+
+### The four side by side
+
+| Approach | You write | Harness & sandbox | Tools available |
+|---|---|---|---|
+| **Manual loop** (this course) | the whole loop | you own both | only what you define |
+| **Tool Runner** | just tool functions | SDK loop; you still host | only what you define |
+| **Claude Agent SDK** | a prompt + options | SDK loop + Claude Code's harness; you still host | built-in Read/Write/Edit/Bash/Grep/WebSearch + MCP + subagents |
+| **Managed Agents** | agent config + your tool results | Anthropic hosts both | Anthropic's sandbox + Skills/MCP + your tools |
+
+The pattern across all three: each one takes over more of what modules 1 through 11 built by hand, in exchange for less direct control over exactly what's happening on a given turn. None of them removes the need for module 10's evals — a Tool Runner agent, an Agent SDK agent, and a Managed Agent all still produce output whose quality has to be measured against a dataset, not eyeballed once and shipped. That pipeline — build cases, run them, grade them two ways, compare against a baseline — travels to whichever of these you pick next.
+
+### Where Wrangler ends
+
+Twelve modules ago, Wrangler was a single `messages.create()` call with no tools. It can now read, write, and edit a sandboxed filesystem; call search, bash, server tools, and an external MCP server; manage a context window that would otherwise overflow; remember facts across separate process runs; stop itself in front of anything risky until a human says go; be checked automatically instead of by hand; run from a real CLI; and be called by another agent as a subagent in its own right. Every one of those pieces was built from the same primitive: a message, a tool result, and a loop that keeps going until the model says it's done. That primitive is the thing worth carrying forward, whichever of the four options above you reach for next.
