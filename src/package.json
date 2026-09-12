@@ -15,7 +15,9 @@
     "08:teach": "tsx 08-memory/main.ts teach",
     "08:recall": "tsx 08-memory/main.ts recall",
     "09": "tsx 09-guardrails/main.ts",
-    "09:dry-run": "tsx 09-guardrails/main.ts --dry-run"
+    "09:dry-run": "tsx 09-guardrails/main.ts --dry-run",
+    "10:tools": "tsx 10-evals/tool-selection.ts",
+    "10:tasks": "tsx 10-evals/task-eval.ts"
   },
   "keywords": [],
   "author": "",
