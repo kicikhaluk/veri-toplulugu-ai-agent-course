@@ -1245,14 +1245,169 @@ Three things worth carrying forward:
 
 Wrangler can now hold a conversation, use tools, manage context, remember things across sessions, and stop itself in front of anything risky until a human says go. The one thing missing is a way to know, systematically, whether any of this actually works well — every check so far has been "I ran it once and read the transcript." Module 10 is evals: turning that manual reading into small, repeatable checks that catch a regression before a human has to notice one by hand.
 
-## Module 10 — Evals: single-step checks and full-run scoring
+## Module 10 — Evals: single-step checks and a prompt-iteration pipeline
 
 Everything up to this point has been verified the same way: run it once, read the transcript, decide by eye whether it looks right. That doesn't scale — it catches nothing the next time a prompt, a tool description, or a model version changes. Module 10 turns that manual reading into code, in `src/10-evals/`.
 
-There are two genuinely different questions to ask about an agent, and they need two different kinds of eval:
+### Four knobs behind every request
 
-- **Does Claude pick the right tool, right now?** A single API call, no execution, no loop — cheap enough to run on every change. `10-evals/tool-selection.ts`.
-- **Did the whole run produce a good outcome?** The full agentic loop, end to end, scored against both mechanical checks and human-grade judgment. `10-evals/task-eval.ts`.
+Before getting into how to score a run, it's worth naming the request-level parameters that shape every run in the first place — one of them (`max_tokens`) has been in every `messages.create()` call since module 1; the others haven't been named yet, and they matter for reading what comes next in this module.
+
+- **Temperature** controls how much randomness goes into picking each next token. It ranges 0.0–1.0 and defaults to 1.0; closer to 0.0 makes output more focused and repeatable (good for analytical or classification tasks), closer to 1.0 makes it more varied (good for creative or exploratory ones). Worth knowing before leaning on it too hard: Anthropic's own docs note that results aren't fully deterministic even at `temperature: 0.0` — sampling noise is only reduced, not eliminated.
+- **Top-p** (nucleus sampling) is a different lever on the same knob: instead of one "how random" dial, it restricts sampling to the smallest set of next-token candidates whose combined probability crosses `p`. The standard guidance is to adjust temperature *or* top-p, never both at once — they shape the same thing, and stacking them makes the effect hard to reason about.
+- **Max tokens** (`max_tokens`) is a hard ceiling on how many tokens a single response may generate — not a target length, just a stop condition. The model usually stops on its own well before hitting it; `max_tokens` only matters when a response would otherwise run long.
+- **Context window** is the total token budget — input and output combined — a single request can use. Haiku 4.5, the model this whole course runs on, has a 200K-token window (roughly 150K words); several newer Claude models offer a 1M-token window instead. This is the hard ceiling module 7 was built around — prompt caching, tool-result summarization, and compaction all exist because a `messages` array that's never trimmed eventually hits it.
+
+One caveat worth flagging explicitly: temperature and top-p are **deprecated on every Claude model released after Opus 4.6** — setting either to anything but its default gets rejected outright with a 400 error on models like Sonnet 5 and Opus 5, which lean on adaptive thinking instead of manual sampling controls. They're still honored on Haiku 4.5, which is exactly why no code in this course has ever needed to touch them: every call so far has run at the implicit default, `temperature: 1.0` — full randomness. That's the randomness actually responsible for the run-to-run variance the eval pipeline below exists to catch.
+
+### Three ways to decide a prompt is good enough
+
+Whenever you change a prompt — a system prompt, a tool description, the wording of a task — there are three ways to decide whether the new version is actually better:
+
+1. **Test it once, ship it if it looks right.** Run it against whatever example comes to mind, read the output, move on.
+2. **Test it a few times, patch the corner cases you happen to notice.** Run it against a handful of inputs, see something odd, tweak the prompt until that specific case looks fine, ship.
+3. **Run it through an evaluation pipeline: score it against a dataset, then iterate on the score.** Build a small set of representative cases up front, grade every run against them the same way every time, and only call a change an improvement if the numbers say so.
+
+Options 1 and 2 are not a strawman — they're the default way almost everyone iterates on a prompt, this course's own modules 1 through 9 included. They're also both a mistake, and the same mistake: judging a change by the handful of cases you personally happened to try, rather than by a dataset that doesn't change out from under you. Module 10's conflict scenario later in this section shows exactly how that goes wrong — the same prompt, run on the same input three separate times, scored 8, 8, and 6 out of 10. Anyone doing option 1 or 2 only sees one of those runs and never finds out there was a range.
+
+There's no code for options 1 and 2 in this module — they're what you were already doing, and what the rest of this section replaces. Everything from here on is option 3, built step by step.
+
+### Step 1: build an eval dataset
+
+An eval dataset is just a set of representative cases with a way to check each one — inputs the agent will actually see, not a single example you made up on the spot. `10-evals/task-eval.ts` uses two, each a fixture pair under `10-evals/fixtures/`:
+
+- **`standard/`** — the same NOTIF-482 incident-retro drafts from module 9. Two sources that *agree*; the merge should just combine them cleanly.
+- **`conflict/`** — a second incident (PAY-119), where the two sources *genuinely disagree* about the root cause: one blames connection-pool exhaustion, the other blames an unbounded retry backoff hammering a degraded upstream. A good merge has to surface that disagreement, not paper over it.
+
+```typescript
+type Scenario = {
+  id: string;
+  fixtureDir: string;
+  task: string;
+  repeats: number; // how many times to run this scenario per prompt under test
+  codeChecks: (root: string) => Promise<CodeCheck[]>;
+  rubric: string;
+  buildGraderInput: (root: string) => Promise<string>;
+};
+```
+
+A dataset like this grows over time the same way a regression-test suite does: every time a real run surfaces a case worth catching next time, it earns a new entry here instead of staying a one-off manual check.
+
+### Step 2: feed the dataset through Claude
+
+Same agentic loop shape as every other module, but parameterized by the one thing actually under test — the system prompt — and run unattended, so `maxTurns` stands in for the human confirmation module 9 relied on to stop a runaway loop:
+
+```typescript
+async function runAgentToCompletion(
+  root: string,
+  task: string,
+  systemPrompt: string | undefined,
+  maxTurns = 8,
+): Promise<void> {
+  const messages: Anthropic.MessageParam[] = [{ role: "user", content: [{ type: "text", text: task }] }];
+  for (let turn = 0; turn < maxTurns; turn++) {
+    const response = await client.messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 1024,
+      ...(systemPrompt ? { system: systemPrompt } : {}),
+      tools,
+      messages,
+    });
+    messages.push({ role: "assistant", content: response.content });
+    if (response.stop_reason !== "tool_use") return;
+    // ...execute each tool_use block directly, no guardrails, no confirmation...
+  }
+}
+```
+
+Each scenario runs in its own fresh temp directory copied from its fixture pair, so runs never interfere with each other or with the shared demo workspace.
+
+### Step 3: feed the result through a grader — two kinds
+
+**Grader A: code-based.** Cheap, deterministic, no model involved — does `merged.md` exist, are the two drafts actually gone, does the merged text contain specific facts pulled from each source:
+
+```typescript
+type CodeCheck = { name: string; ok: boolean };
+// e.g. { name: "covers root-cause detail from draft-a", ok: /retry buffer/i.test(merged) }
+```
+
+**Grader B: model-based**, for the part that's actually about judgment — Haiku, given a clear system prompt describing exactly the JSON shape we want back, backed by a forced tool call so we get a real, always-parseable object instead of hand-parsing JSON the model might format slightly wrong:
+
+```typescript
+const GRADER_SYSTEM_PROMPT = `You are an impartial grader reviewing a document an AI agent produced for a task.
+You will be given the grading rubric for this task, followed by the material to grade.
+Respond with a single call to the submit_grade tool, in this shape:
+- strengths: an array of 1 to 3 key strengths of the result
+- weakness: an array of 1 to 3 key areas for improvement
+- reasoning: a concise explanation of your overall assessment
+- score: a number from 1 (fails the rubric badly) to 10 (fully meets it)`;
+
+const graderTool: Anthropic.Tool = {
+  name: "submit_grade",
+  input_schema: {
+    type: "object",
+    properties: {
+      strengths: { type: "array", items: { type: "string" } },
+      weakness: { type: "array", items: { type: "string" } },
+      reasoning: { type: "string" },
+      score: { type: "integer" },
+    },
+    required: ["strengths", "weakness", "reasoning", "score"],
+  },
+};
+// called with model: "claude-haiku-4-5", system: GRADER_SYSTEM_PROMPT,
+// tool_choice: { type: "tool", name: "submit_grade" }
+```
+
+Two graders, not one, because they catch different things. The code grader never drifts — it means the same thing every run — but it can only check what you thought to encode as a regex or a file check. The model grader can judge things like "did this actually surface the disagreement," which no regex realistically captures, but its score can vary between two runs of the identical input, as the next section shows.
+
+### Step 4: change the prompt and repeat — with a baseline first
+
+The point of steps 1–3 isn't a one-off score, it's a way to tell whether a *change* helped. That requires running the same dataset through more than one prompt and comparing:
+
+```typescript
+const BASELINE_SYSTEM_PROMPT: string | undefined = undefined;
+
+const CANDIDATE_SYSTEM_PROMPT =
+  "You are Wrangler, an agent that merges related documents in a shared workspace. " +
+  "When two sources disagree about a material fact — a root cause, an owner, a date — do not silently " +
+  'pick one account or blend them into vague, both-could-be-true language. Add an explicit "Disagreement" ' +
+  "section naming exactly what each source claims, so a human can resolve it. Only merge silently when " +
+  "the sources actually agree.";
+```
+
+"No system prompt" is a legitimate baseline here — it's exactly what module 9's demo ran, and it's what first turned up inconsistent conflict handling. Running the full dataset through both prompts live, with the conflict scenario repeated 3 times per prompt since that's the one known to vary:
+
+```
+=== baseline: no system prompt ===
+  [standard-merge] run 1/1 — code PASS  model score 9/10
+  [conflicting-root-cause] run 1/3 — code PASS  model score 8/10
+      weakness: doesn't explicitly flag the conceptual disagreement about root causation...
+  [conflicting-root-cause] run 2/3 — code PASS  model score 8/10
+      weakness: presents these as a single 'root cause' [...] somewhat obscures [...] that Draft A
+      and Draft B actually disagreed about what caused the incident...
+  [conflicting-root-cause] run 3/3 — code PASS  model score 6/10
+      weakness: Presents one cause as 'Primary' and the other as merely 'Amplifying,' which subtly
+      privileges Sana's diagnosis despite the rubric's instruction to surface disagreement [...]
+      Does not explicitly flag the disagreement as unresolved [...] a reader might assume consensus
+      was reached
+
+=== candidate: explicit disagreement instruction ===
+  [standard-merge] run 1/1 — code PASS  model score 9/10
+  [conflicting-root-cause] run 1/3 — code PASS  model score 9/10
+  [conflicting-root-cause] run 2/3 — code PASS  model score 7/10
+  [conflicting-root-cause] run 3/3 — code PASS  model score 9/10
+
+=== summary: baseline vs candidate ===
+standard-merge:
+  baseline  — avg model score 9.0/10, code pass rate 100%
+  candidate — avg model score 9.0/10, code pass rate 100%
+conflicting-root-cause:
+  baseline  — avg model score 7.3/10, code pass rate 100%
+  candidate — avg model score 8.3/10, code pass rate 100%
+```
+
+That's the whole pipeline paying off: the candidate prompt didn't touch the scenario it was already handling well (`standard-merge` stays flat at 9.0), and it measurably improved the one it was written for (`conflicting-root-cause` up a full point on average, 7.3 → 8.3) — a real, if imperfect, improvement rather than a guess dressed up as one. It's still not a clean, every-run 10/10; run 2 of the candidate scored a 7, a reminder that one prompt tweak rarely fixes a whole failure mode outright. That's exactly the kind of signal option 1 or 2 would never surface — a single manual test of the candidate prompt could easily have landed on that one 7/10 run, or on one of the two 9/10 runs, and told a completely different story about whether the change worked.
 
 ### Single-step: does Claude pick the right tool
 
@@ -1293,102 +1448,21 @@ PASS  no-tool-needed — a question that doesn't touch the workspace shouldn't t
 6/6 tool-selection cases passed.
 ```
 
-### Full-run: did the outcome actually work
-
-Tool selection alone doesn't tell you whether a multi-turn task actually finished in a good state — that needs the real loop, run to completion, in a disposable workspace:
-
-```typescript
-async function runAgentToCompletion(root: string, task: string, maxTurns = 8): Promise<string> {
-  const messages: Anthropic.MessageParam[] = [{ role: "user", content: [{ type: "text", text: task }] }];
-  for (let turn = 0; turn < maxTurns; turn++) {
-    const response = await client.messages.create({ model: "claude-haiku-4-5", max_tokens: 1024, tools, messages });
-    messages.push({ role: "assistant", content: response.content });
-    if (response.stop_reason !== "tool_use") { /* ...return final text... */ }
-    // ...execute each tool_use block directly, no guardrails, no confirmation...
-  }
-  return "(hit max turn cap without the model stopping — treating as incomplete)";
-}
-```
-
-Two things are deliberately different from module 9's loop. There's no `runGuarded()` — evals run unattended, with nobody at a keyboard to type "y" — and `maxTurns` is the safety net that replaces human confirmation: an agent that never converges fails the eval instead of looping forever.
-
-Each scenario copies a fixture pair of draft files into a fresh temp directory, runs the merge-and-delete task against it, then grades the result two ways:
-
-- **Code checks** — cheap, deterministic, no model involved: does `merged.md` exist, are the two drafts actually gone, does the merged text contain specific facts pulled from each source.
-- **A grader call** — for the part that's actually about judgment, forced through a tool so the score comes back structured instead of parsed out of prose:
-
-```typescript
-const graderTool: Anthropic.Tool = {
-  name: "submit_grade",
-  input_schema: {
-    type: "object",
-    properties: {
-      score: { type: "integer", description: "1 (fails the rubric) to 5 (fully meets it)" },
-      passed: { type: "boolean" },
-      reasoning: { type: "string" },
-    },
-    required: ["score", "passed", "reasoning"],
-  },
-};
-// called with tool_choice: { type: "tool", name: "submit_grade" }
-```
-
-On the standard scenario — the same NOTIF-482 drafts from module 9 — both layers agree it worked:
-
-```
-=== scenario: standard-merge ===
-  [code check] PASS  merged.md exists
-  [code check] PASS  draft-a.md deleted
-  [code check] PASS  draft-b.md deleted
-  [code check] PASS  covers root-cause detail from draft-a
-  [code check] PASS  covers timeline detail from draft-b
-  [grader]     score=5/5  passed=true
-  [grader]     The merged document excellently preserves all substantial content from both source
-  drafts without duplication. It cleanly integrates Priya's technical observations [...] with
-  Marcus's timeline and follow-ups into a well-organized final retro document [...]
-```
-
-### A conflict scenario, and eval variance as a real finding
-
-The interesting eval isn't the one that always passes. `fixtures/conflict/` is a second, harder scenario: two drafts about the same fictional incident (PAY-119) that **genuinely disagree** about the root cause — Sana's notes blame connection-pool exhaustion, Devrim's blame an unbounded retry backoff hammering a degraded upstream. The task prompt is identical to the standard scenario's; the rubric asks something different: does the merge surface that the sources disagree, rather than silently picking one account or blending them into something neither draft actually said.
-
-Running this scenario twice, live, produced two different verdicts. First run:
-
-```
-[grader]     score=2/5  passed=false
-[grader]     [...] treats them as complementary factors rather than explicitly calling out the
-fundamental disagreement between the drafts. Sana identifies connection-pool exhaustion as THE
-root cause, while Devrim identifies unbounded retry backoff as THE root cause—the merged version
-conflates them into "exacerbated by" language that obscures which engineer's analysis was correct
-[...] A human reader cannot clearly see the disagreement to resolve it.
-```
-
-Second run, same fixtures, same task, same rubric:
-
-```
-[grader]     score=4/5  passed=true
-[grader]     The merged document explicitly surfaces the disagreement by structuring it as "Primary
-Issue" vs "Contributing Factor" under Root Cause Analysis, making the competing accounts clearly
-visible. However, it presents them as simultaneous rather than exploring whether one actually
-caused the other, which leaves some interpretive ambiguity about their relationship.
-```
-
-Both the merge itself and the grading of it varied between runs of the exact same scenario — one run produced a merge that genuinely buried the disagreement, the other produced one that structurally called it out. That's not a bug in the eval harness; it's what running a non-deterministic model twice actually looks like. The practical consequence: a single pass/fail from an LLM-graded scenario is a sample, not a verdict. For a scenario that matters, run it several times and look at the pass rate, or treat one failure as "worth a closer look" rather than "broken" — exactly the way you'd treat a single flaky test in any other test suite, except here the flakiness is coming from the thing under test itself, not the test infrastructure.
-
 ### Running it
 
 ```
 cd src
 npx tsx 10-evals/tool-selection.ts   # 6 single-step cases, ~seconds
-npx tsx 10-evals/task-eval.ts        # 2 full-run scenarios, a bit slower and pricier
+npx tsx 10-evals/task-eval.ts        # baseline vs candidate prompt, over the full dataset
 ```
 
-Both scripts set `process.exitCode = 1` on any failure, so they plug into a CI step (`npm run 10:tools && npm run 10:tasks`) the same way any other test command would.
+`tool-selection.ts` sets `process.exitCode = 1` on any failure, so it plugs into a CI step the way any other test command would — it's a fast regression check with a clear pass/fail. `task-eval.ts` is deliberately not a pass/fail gate; its job is comparison, and "did the score move, and in which direction" is the thing worth reading, not an exit code.
 
-Three things worth carrying forward:
+Four things worth carrying forward:
 
-- **Keep deterministic checks and judgment calls separate.** Code checks (file exists, content matches a pattern) don't drift between runs; a grader call can. Run the cheap deterministic layer first — it's the one you can actually trust to mean the same thing tomorrow.
+- **A single manual test of a prompt change tells you almost nothing.** The conflict scenario scored anywhere from 6 to 9 out of 10 on the exact same baseline prompt across three runs. Anyone shipping on the strength of one good-looking test (option 1) or a couple of patched corner cases (option 2) is reading noise and calling it signal.
+- **Always compare against a baseline, not just a target score.** "Is this prompt good" is a much weaker question than "did this change help, relative to what we had before" — the second one is what actually tells you whether an edit was worth making.
+- **Keep deterministic checks and judgment calls in separate graders.** Code checks (file exists, content matches a pattern) don't drift between runs; a model grader can. Run the cheap deterministic layer first — it's the one you can actually trust to mean the same thing tomorrow — and let the model grader carry only the part that genuinely requires judgment.
 - **An unattended loop needs a turn cap where a guarded one had a human.** `maxTurns` in `runAgentToCompletion` isn't a performance optimization — it's what stands in for the confirmation prompt module 9 relied on to stop a runaway loop.
-- **An eval that always passes is telling you less than one that sometimes fails.** The conflict scenario is more useful than the standard one precisely because it's the one that occasionally catches the model doing something you don't want — silently flattening a real disagreement into agreeable-sounding prose.
 
 Wrangler can now hold a conversation, use tools, manage context, remember things across sessions, guard itself against risky actions, and be checked automatically instead of by hand. Module 11 is composability: turning Wrangler from a script you run directly into something with a real CLI entry point, and something other agents can call as a tool or subagent in its own right.
