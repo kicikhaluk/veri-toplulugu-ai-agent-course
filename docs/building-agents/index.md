@@ -110,7 +110,7 @@ cd src
 npx tsx 01-first-call/main.ts
 ```
 
-**Why Haiku 4.5, not a bigger model?** Every module in this course makes several requests while you iterate — this is a course about the *loop*, not about squeezing maximum reasoning out of one call. Claude Haiku 4.5 is fast and inexpensive, so you can re-run examples freely without worrying about cost. Everything we build is model-agnostic: once Wrangler is done, swap `model: "claude-haiku-4-5"` for `model: "claude-opus-5"` anywhere you want more capable reasoning (tool selection on ambiguous tasks, longer agentic runs) at a higher cost per token.
+**Why Haiku 4.5, not a bigger model?** Every module in this course makes several requests while you iterate — this is a course about the *loop*, not about squeezing maximum reasoning out of one call. Claude Haiku 4.5 is fast and inexpensive, so you can re-run examples freely without worrying much about cost. Overall probably you will spend some peny not dollars. Everything we build is model-agnostic: once Wrangler is done, swap `model: "claude-haiku-4-5"` for `model: "claude-opus-5"` anywhere if you would like to have more capable reasoning (tool selection on ambiguous tasks, longer agentic runs) at a higher cost per token.
 
 A few things worth noticing before we move on, because they explain the shape of everything that follows:
 

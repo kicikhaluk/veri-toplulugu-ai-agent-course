@@ -80,3 +80,44 @@ Typescript için de ufak bir `tsconfig.json` dosyası oluşturun:
 ```
 
 `strict` ve `noUncheckedIndexedAccess` burada önemli. Tool girdileri modelden `unknown` tipinde JSON olarak gelir, JSON'un şeklini hiç kontrol etmeden kodlamaya devam ederseniz rahatlıkla hatalar alabilirsiniz.
+
+## Modül 1 — Claude'a ilk isteğiniz
+
+Herhangi bir loop ya da tool'dan önce tek bir istek atıp cevabı okuyalım. Kod `src/01-first-call/main.ts` dosyasında:
+
+```typescript
+import "dotenv/config";
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic(); // reads ANTHROPIC_API_KEY, loaded from .env by dotenv/config
+
+const response = await client.messages.create({
+  model: "claude-haiku-4-5",
+  max_tokens: 1024,
+  system: "You are a terse assistant. Answer in one sentence.",
+  messages: [{ role: "user", content: "What is an AI agent, in plain terms?" }],
+});
+
+for (const block of response.content) {
+  if (block.type === "text") {
+    console.log(block.text);
+  }
+}
+```
+
+Çalıştırmak için:
+
+```bash
+cd src
+npx tsx 01-first-call/main.ts
+```
+
+**Neden Haiku 4.5, daha gelişmiş bir model değil?** Bu kursun her modülünde, siz denemeler yaparken birden fazla istek atacaksınız. Claude Haiku 4.5 hızlı ve ucuz, bu yüzden örnekleri maliyeti çok düşünmeden istediğiniz kadar tekrar çalıştırabilirsiniz. Muhtemelen toplamda dolar değil, birkaç kuruş harcayacaksınız. Kurduğumuz her şey model-agnostic: Wrangler bittiğinde, daha belirsiz görevlerde daha güçlü reasoning (tool seçimi, daha uzun agentic çalışmalar) istediğiniz her yerde, token başına daha yüksek maliyet karşılığında `model: "claude-haiku-4-5"` yazan yerleri `model: "claude-opus-5"` ve ya sonnet ile değiştirebilirsiniz.
+
+Devam etmeden önce aşağıdakilere bir göz atmakta/değinmekte fayda var:
+
+- **`response.content`, bir string değil, bloklardan oluşan bir array'dir.** Tek bir cevap; text, tool çağrıları ve thinking bloklarını bir arada barındırabilir. Bir alanı okumadan önce her zaman `block.type`'a göre fonksiyonu şekillendirmemiz gerek. Claude ister sadece mesaj iletsin, ister bir tool kullanmak istiyor olsun, aynı response şeklinin işlemesini bu parametre ile kontrol edebiliriz.
+- **`messages`, bir session handle'ı değil, sizin oluşturduğunuz bir array'dir.** Ortada bir `client.startConversation()` yok. "Konuşma" dediğimiz şey sadece bu array'dir ve ikinci bir tur istiyorsanız, *siz* bu array'e ekleme yapıp her şeyi tekrar gönderirsiniz. Bu kursun geri kalanı aslında tam olarak bu detay üzerine kurulu.
+- **`system`, `messages`'dan ayrıdır.** Modele verdiğiniz sabit talimattır.
+
+Kullanıcı mesajını değiştirip tekrar çalıştırmayı deneyin — çalıştırmalar arasında hiçbir state'in taşınmadığını fark edeceksiniz. Bir sonraki modülde bu geçmişi turlar arasında kalıcı hale getirip ilk tool'u ekleyeceğiz; bu da bu tek seferlik çağrıyı bir agent loop'unun başlangıcına dönüştürecek.
