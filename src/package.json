@@ -17,7 +17,9 @@
     "09": "tsx 09-guardrails/main.ts",
     "09:dry-run": "tsx 09-guardrails/main.ts --dry-run",
     "10:tools": "tsx 10-evals/tool-selection.ts",
-    "10:tasks": "tsx 10-evals/task-eval.ts"
+    "10:tasks": "tsx 10-evals/task-eval.ts",
+    "11:cli": "tsx 11-composability/cli.ts",
+    "11:subagent": "tsx 11-composability/subagent-demo.ts"
   },
   "keywords": [],
   "author": "",

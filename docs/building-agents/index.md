@@ -1466,3 +1466,151 @@ Four things worth carrying forward:
 - **An unattended loop needs a turn cap where a guarded one had a human.** `maxTurns` in `runAgentToCompletion` isn't a performance optimization — it's what stands in for the confirmation prompt module 9 relied on to stop a runaway loop.
 
 Wrangler can now hold a conversation, use tools, manage context, remember things across sessions, guard itself against risky actions, and be checked automatically instead of by hand. Module 11 is composability: turning Wrangler from a script you run directly into something with a real CLI entry point, and something other agents can call as a tool or subagent in its own right.
+
+## Module 11 — Composability: a CLI entry point, and Wrangler as a subagent
+
+Every module so far has been `main.ts`: a hardcoded task, a hardcoded workspace, run directly. That's fine for teaching one idea at a time, but it means Wrangler has never been something *else* could call. Module 11 doesn't add new agent behavior — it takes the loop that already exists and makes it reusable, in `src/11-composability/`.
+
+### Pulling the loop out from under `main.ts`
+
+`11-composability/wrangler.ts` is the same five tools and the same tool-use loop from every prior module, but restructured as one exported function instead of a top-level script:
+
+```typescript
+export async function runWrangler(root: string, task: string, options: WranglerOptions = {}): Promise<WranglerResult> {
+  const { systemPrompt, maxTurns = 8, onTurn } = options;
+  const messages: Anthropic.MessageParam[] = [{ role: "user", content: [{ type: "text", text: task }] }];
+  let lastText = "";
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    const response = await client.messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 1024,
+      ...(systemPrompt ? { system: systemPrompt } : {}),
+      tools,
+      messages,
+    });
+    onTurn?.(response);
+    messages.push({ role: "assistant", content: response.content });
+
+    const textBlock = response.content.find((b): b is Anthropic.TextBlock => b.type === "text");
+    if (textBlock) lastText = textBlock.text;
+    if (response.stop_reason !== "tool_use") return { finalText: lastText, turns: turn + 1 };
+
+    // ...execute each tool_use block, same dispatcher as every other module...
+  }
+
+  return { finalText: lastText || "(stopped: reached max turns without a final text answer)", turns: maxTurns };
+}
+```
+
+Two things changed to make that possible, both small:
+
+- **`root` is a parameter, not a constant.** Every module through 10 resolved paths against a workspace baked into the file with `path.resolve(import.meta.dirname, "workspace")`. A reusable Wrangler has to work against whatever directory its caller hands it — `makeResolver(root)` builds the same sandbox guard from module 3 fresh for each call, scoped to that root.
+- **The function returns something.** Every prior loop just ran and printed as it went; nobody downstream needed the result as a value. A caller — a human at a CLI, or another agent — needs an actual answer back, so `runWrangler` tracks the last text block it saw and returns it alongside how many turns the run took.
+
+`onTurn` is the one hook added purely for observability: both consumers below pass a callback that logs each turn, but `wrangler.ts` itself doesn't know or care who's listening.
+
+### A real CLI entry point
+
+`11-composability/cli.ts` is what "CLI entry point" means concretely: the task and the workspace stop being constants and become arguments.
+
+```typescript
+function parseArgs(argv: string[]): { workspace: string; task: string; maxTurns?: number } {
+  // --workspace/-w and --max-turns are flags; everything else joins into the task string
+}
+
+const { workspace, task, maxTurns } = parseArgs(process.argv.slice(2));
+const result = await runWrangler(workspace, task, { maxTurns, onTurn: /* print each turn */ });
+console.log(result.finalText);
+```
+
+Run live against the same NOTIF-482 drafts every other module has used — from `src/`, same as every other module's `npx tsx` command:
+
+```
+$ npx tsx 11-composability/cli.ts --workspace ./11-composability/workspace "Read draft-a.md and draft-b.md and merge them into merged.md, combining the timeline and follow-ups without duplicating content."
+
+workspace: /.../11-composability/workspace
+task: Read draft-a.md and draft-b.md and merge them into merged.md, combining the timeline and follow-ups without duplicating content.
+
+text: I'll start by reading both draft files to see their contents.
+tool_use: read_file({"path":"draft-a.md"})
+tool_use: read_file({"path":"draft-b.md"})
+text: Now I'll merge these two documents into a single file, combining the timeline and follow-ups while avoiding duplication:
+tool_use: write_file({"path":"merged.md", ...})
+text: Done! I've merged both drafts into `merged.md`. [...]
+
+--- done in 3 turn(s) ---
+Done! I've merged both drafts into `merged.md`. [...]
+```
+
+Nothing about the agent changed — it's the exact same loop as module 9 without the guardrail wrapper. What changed is that this is now a command someone can point at a different folder with a different task without editing the source file at all.
+
+### Wrangler as a subagent: one agent's tool is another agent's whole loop
+
+The more interesting consumer of `runWrangler` isn't a human — it's another Claude call. `11-composability/subagent-demo.ts` sets up a *parent* agent whose only tool delegates entirely to Wrangler:
+
+```typescript
+const delegateTool: Anthropic.Tool = {
+  name: "delegate_to_wrangler",
+  description:
+    "Hand a filesystem task off to Wrangler, a document-editing agent with its own read/write/edit/delete tools " +
+    "over the shared workspace. Wrangler runs its own multi-turn loop to completion and reports back only its " +
+    "final answer — you don't see its intermediate steps, and it has no memory of this conversation.",
+  input_schema: {
+    type: "object",
+    properties: {
+      task: { type: "string", description: "A complete, self-contained instruction for Wrangler — it cannot see anything said here." },
+    },
+    required: ["task"],
+  },
+};
+```
+
+From the parent's point of view, `delegate_to_wrangler` is a tool exactly like `read_file` was to Wrangler itself — one JSON input, one string output. What actually happens when the parent calls it is a full nested agent loop:
+
+```typescript
+const { task } = block.input as { task: string };
+const result = await runWrangler(workspaceRoot, task, { onTurn: /* prefix-logged as [wrangler] */ });
+toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result.finalText, is_error: false });
+```
+
+The parent's system prompt tells it to never touch files directly and always delegate. Run live:
+
+```
+--- parent turn (stop_reason: tool_use) ---
+parent text: I'll delegate this task to Wrangler to read the two draft files, merge them, clean up the originals, and then report back what was covered.
+parent tool_use: delegate_to_wrangler({"task":"Read the contents of draft-a.md and draft-b.md. Merge them into a single file called merged.md ... report back its complete contents..."})
+  [wrangler] starting nested run — task: Read the contents of draft-a.md and draft-b.md. Merge them into a single file called merged.md ...
+  [wrangler] text: I'll help you merge these files. Let me start by reading both draft files.
+  [wrangler] tool_use: read_file({"path":"draft-a.md"})
+  [wrangler] tool_use: read_file({"path":"draft-b.md"})
+  [wrangler] tool_use: write_file({"path":"merged.md", ...})
+  [wrangler] tool_use: delete_file({"path":"draft-a.md"})
+  [wrangler] tool_use: delete_file({"path":"draft-b.md"})
+  [wrangler] tool_use: read_file({"path":"merged.md"})
+  [wrangler] text: Perfect! I've successfully merged the files. Here's a summary [...]
+  [wrangler] finished in 4 turn(s)
+
+--- parent turn (stop_reason: end_turn) ---
+parent text: Perfect! The merge is complete. Here's what the merged incident-retro notes ended up covering: [...]
+```
+
+The `[wrangler]` lines only exist because this demo's `onTurn` logs them — the parent model never sees them. All it sees is one `tool_result` containing Wrangler's final paragraph. Four whole turns of reading, writing, and deleting files happened inside a single tool call from the parent's perspective, the same way `read_file` hides a filesystem call behind one JSON response. That's the core idea of an agent-as-tool: nesting is invisible from the outside: a tool call either returns a string, or it happens to run an entire agent to produce one.
+
+One thing this demo deliberately doesn't handle: Wrangler here has no guardrails, because there's no human at a keyboard to type `y` or `DELETE` when it's running headless inside someone else's tool call — the same problem module 10's `maxTurns` solved for unattended eval runs. A composable Wrangler that needed real risk controls would swap `executeTool` for module 9's `runGuarded`, but with a fixed, non-interactive policy decided in advance — auto-approve `confirm`-tier, refuse `irreversible`-tier outright — rather than a confirmation prompt that has nobody to answer it.
+
+### Running it
+
+```
+cd src
+npx tsx 11-composability/cli.ts --workspace ./11-composability/workspace "<task>"
+npx tsx 11-composability/subagent-demo.ts
+```
+
+Three things worth carrying forward:
+
+- **A reusable agent is a function that returns a value, not a script that prints and exits.** The loop itself didn't change from module 9 to module 11 — what changed is that `root` became a parameter and the final answer became a return value instead of the last thing printed to the console.
+- **An agent-as-tool is just a tool whose execution happens to be another whole agent loop.** Nothing about the parent's `messages.create()` call knows or needs to know that `delegate_to_wrangler` isn't a single filesystem operation — the tool-use contract (one input, one output) is exactly what makes an arbitrarily complex subagent look identical to a one-line tool from the caller's side.
+- **Guardrails don't disappear when an agent goes headless, they change shape.** A human confirmation prompt only works when a human is there to answer it; a subagent needs its risk policy decided in advance, not asked for at runtime.
+
+Wrangler now runs from the command line, checks itself automatically, and can be called by another agent as a black box. Module 12 closes out the course: where Wrangler's hand-rolled loop sits next to the Tool Runner, the Claude Agent SDK, and Managed Agents — and when reaching for one of those beats building the loop yourself.
