@@ -11,7 +11,15 @@
     "04": "tsx 04-search-and-bash/main.ts",
     "05": "tsx 05-server-tools/main.ts",
     "06": "tsx 06-mcp-connector/main.ts",
+<<<<<<< Updated upstream
     "07": "tsx 07-context-management/main.ts"
+=======
+    "07": "tsx 07-context-management/main.ts",
+    "08:teach": "tsx 08-memory/main.ts teach",
+    "08:recall": "tsx 08-memory/main.ts recall",
+    "09": "tsx 09-guardrails/main.ts",
+    "09:dry-run": "tsx 09-guardrails/main.ts --dry-run"
+>>>>>>> Stashed changes
   },
   "keywords": [],
   "author": "",

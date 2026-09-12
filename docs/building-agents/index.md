@@ -1000,3 +1000,250 @@ Four things worth carrying forward:
 - **A compaction call is a fork, and forks must match their parent's prefix exactly.** Reusing the same `system`, `tools`, and `model` for the summarization request isn't a style preference — it's what lets that one-off call read the cache the main loop already built instead of paying to rebuild it.
 
 Wrangler can now run for a long time without its own transcript becoming the bottleneck. What it still can't do is remember anything once the process exits — every module so far has lived and died with a single `npx tsx` invocation. Module 8 is memory: giving Wrangler a way to carry facts, preferences, and progress across separate runs, not just across turns within one.
+<<<<<<< Updated upstream
+=======
+
+## Module 8 — Memory: carrying facts across separate runs
+
+Everything Wrangler has learned in Modules 1–7 lives in `messages`, and `messages` lives in one process's memory — literally. Kill the `npx tsx` process and it's gone, cache and all. This module gives Wrangler a **memory tool**: an Anthropic-defined, client-executed tool (same family as `bash` and `text_editor` from Module 5's docs, though this course hasn't wired those two in) that lets Claude read and write files in a directory that survives past the end of any one conversation. The tool itself is one line — `{ type: "memory_20250818", name: "memory" }`, no `input_schema`, no beta header, available on any Claude 4-or-later model — but everything it does is client-side, which means Wrangler is entirely responsible for implementing what "a file that persists" actually means.
+
+### The six commands, and where they actually live
+
+The model always addresses memory through a virtual root, `/memories` — a path that has nothing to do with the real filesystem. Mapping it onto real storage is the tool's entire implementation surface:
+
+```typescript
+const MEMORY_PREFIX = "/memories";
+const memoryRoot = path.resolve(import.meta.dirname, "memory");
+
+function resolveMemoryPath(virtualPath: string): string {
+  if (virtualPath !== MEMORY_PREFIX && !virtualPath.startsWith(MEMORY_PREFIX + "/")) {
+    throw new Error(`"${virtualPath}" must start with ${MEMORY_PREFIX}`);
+  }
+  const relative = virtualPath === MEMORY_PREFIX ? "." : virtualPath.slice(MEMORY_PREFIX.length + 1);
+  const target = path.resolve(memoryRoot, relative);
+  if (target !== memoryRoot && !target.startsWith(memoryRoot + path.sep)) {
+    throw new Error(`"${virtualPath}" resolves outside ${MEMORY_PREFIX} — refusing.`);
+  }
+  return target;
+}
+```
+
+This is the exact same shape as `resolveSafePath` from Module 3 — resolve, then verify the result is still inside the boundary — applied to a boundary that's virtual on one side (`/memories`, which the model believes in) and real on the other (`08-memory/memory/`, an actual directory on disk that, unlike every `workspace/` this course has used so far, is **never reset between runs**). Six commands sit on top of it — `view`, `create`, `str_replace`, `insert`, `delete`, `rename` — each with a documented input shape and, importantly, documented *return-string wording*. Claude was trained against those exact strings (`"File created successfully at: {path}"`, `"The path {path} does not exist. Please provide a valid path."`, and so on), so [`08-memory/main.ts`](../../src/08-memory/main.ts) matches them rather than inventing its own phrasing — this is one of the few places in this course where the tool's *output text*, not just its schema, is worth getting exactly right.
+
+### An instruction this module never wrote
+
+No system prompt is set anywhere in this module's code — deliberately. When the memory tool is present in `tools`, the API injects its own instruction ahead of everything else, telling Claude to check `/memories` before doing anything and to write down progress because its context might be reset at any moment. Nothing in `main.ts` asks for that. The proof is in the very first tool call of a live run whose task text never mentions memory at all:
+
+```
+Task: "Remember two facts for future sessions: (1) our on-call escalation
+policy is to page the secondary on-call after 15 minutes of no
+acknowledgment from the primary; (2) the 'payments' service is owned by
+the Payments team, reachable in Slack at #payments-oncall."
+
+--- turn (stop_reason: tool_use) ---
+text: I'll save these two important facts to my memory for future reference.
+tool_use: memory({"command":"view","path":"/memories"})
+```
+
+`view` before anything else, on a task whose own wording never says to check memory first. That's the injected protocol acting on a prompt this course never wrote.
+
+### Running it — as two genuinely separate processes
+
+```
+cd src
+npx tsx 08-memory/main.ts teach
+npx tsx 08-memory/main.ts recall
+```
+
+These are two separate invocations of `node`, run one after the other, each starting `messages` from a single, unrelated task string — there is no shared process, no shared variable, nothing in memory (the ordinary kind) connecting them. The first teaches Wrangler two facts:
+
+```
+turn 1 (tool_use): memory({ command: "view", path: "/memories" })
+  tool_result: "...4.0K  /memories" (empty — first run)
+
+turn 2 (tool_use): memory({
+  command: "create",
+  path: "/memories/oncall_and_services.md",
+  file_text: "# On-Call Policies & Service Ownership\n\n## On-Call Escalation Policy\n..."
+})
+  tool_result: "File created successfully at: /memories/oncall_and_services.md"
+
+turn 3 (end_turn): "Perfect! I've saved both facts to my memory: ..."
+```
+
+`08-memory/memory/oncall_and_services.md` now exists as a real file on disk. The second invocation — a brand new `node` process, a `messages` array containing only the question "What's our on-call escalation policy, and who owns the payments service?", nothing else — asks for those same facts back:
+
+```
+turn 1 (tool_use): memory({ command: "view", path: "/memories" })
+  tool_result: "...4.0K  /memories  421B  /memories/oncall_and_services.md"
+
+turn 2 (tool_use): memory({ command: "view", path: "/memories/oncall_and_services.md" })
+  tool_result: "Here's the content of /memories/oncall_and_services.md with line numbers:
+       1  # On-Call Policies & Service Ownership
+       ...
+       9  - Reachable for on-call escalations and issues related to the payments service"
+
+turn 3 (end_turn): "On-Call Escalation Policy: Page the secondary on-call after 15 minutes
+  of no acknowledgment... Payments Service Ownership: Owner: Payments team, Contact:
+  #payments-oncall on Slack..."
+```
+
+Both facts, correct, recovered by a process that never saw the conversation where they were taught. Nothing about the second run's code path is different from the first — it's the same `main.ts`, the same tool, the same virtual `/memories` root. The only thing that made the second answer possible is that `resolveMemoryPath` always points at the same real directory, and that directory was never torn down.
+
+### Where this fits next to caching and compaction
+
+Module 7 already gave Wrangler tools for a transcript that's grown too large *within* a session — trim old results, compact the whole thing into a summary. Memory solves a different problem: information that needs to survive *past* a session, deliberately, not because the transcript got too big to hold it but because the next conversation has no transcript at all. Anthropic's own docs describe running both together on long-lived agents — compaction keeps the live context small without any client-side bookkeeping, while memory is where anything that must survive a compaction gets written down on purpose. Module 7's compaction is a blunt instrument by comparison: it summarizes *everything*, indiscriminately, the moment a threshold is crossed. Memory is selective — only what Wrangler explicitly decides is worth a file.
+
+Three things worth carrying forward:
+
+- **A client-side tool with a fixed contract is still yours to implement, wording included.** `memory_20250818` has no `input_schema` because Anthropic defines the interface, but the storage backend, the path safety, and even the exact return strings are entirely your code — and getting the wording right matters here more than for a custom tool, because the model was trained against it.
+- **The API can add to the system prompt without your code doing anything.** The memory protocol instruction appears purely because the tool is present in `tools` — visible proof that "the prompt Claude sees" and "the prompt you wrote" aren't always the same string.
+- **Cross-session persistence means literally never talking to the same process twice.** The only convincing test of "does this survive a session" is starting a genuinely new one — a second `npx tsx` invocation with no shared state — not two turns in a loop that happens to still be running.
+
+Wrangler can now hold a conversation, use tools, manage its own context, and remember things across restarts. What it still does today, and only today, is exactly what it's told — every task in this course so far has been something Wrangler was explicitly asked to do, and every risky action (writing a file, running a command) has gone through without anyone checking first. Module 9 is guardrails: risk-tiering tools, a human-in-the-loop confirmation step for the ones that matter, and an audit log of what Wrangler actually did.
+
+## Module 9 — Guardrails: risk tiers, confirmation, and an audit trail
+
+Every tool call this course has executed so far has run the moment the model asked for it. That was fine for a workspace full of throwaway markdown files, but it doesn't generalize — a real Wrangler with `write_file` and `delete_file` in its toolbox is one bad plan away from destroying something a human cared about. Module 9 doesn't add new tools; it adds a layer *in front of* the existing ones that decides, per call, whether to run it immediately, ask a human first, or refuse outright in dry-run mode. Nothing about `executeTool()` in [`09-guardrails/main.ts`](../../src/09-guardrails/main.ts) changes from the module 3 shape — every tool call is now just routed through a `runGuarded()` wrapper first.
+
+### Risk tiers, not one-size-fits-all trust
+
+The whole design rests on one map from tool name to risk tier:
+
+```typescript
+type RiskTier = "auto" | "confirm" | "irreversible";
+
+const RISK_TIER: Record<string, RiskTier> = {
+  list_dir: "auto",
+  read_file: "auto",
+  write_file: "confirm",
+  edit: "confirm",
+  delete_file: "irreversible",
+};
+```
+
+`auto` tools run immediately — they're read-only, nothing to approve. `confirm` tools mutate the workspace but recoverably, so a plain yes/no from a human is enough. `irreversible` tools destroy something with no undo, so the bar is higher: typing the literal word `DELETE`, not just "y", the same friction GitHub uses before it lets you delete a repository. A tool with no entry in the map defaults to `irreversible` — an unrecognized tool name fails closed, not open, which matters more here than anywhere else in this course: the risk-tiering logic is the one place where "I forgot to register this" should never silently mean "runs unchecked."
+
+### Human-in-the-loop confirmation, live
+
+The confirmation itself is a real `readline` prompt to whoever is running the process in their terminal — not a mocked check, not a config flag, an actual blocking question:
+
+```typescript
+async function confirmYesNo(promptText: string): Promise<boolean> {
+  const answer = (await rl.question(promptText)).trim().toLowerCase();
+  return answer === "y" || answer === "yes";
+}
+
+async function confirmPhrase(promptText: string, expected: string): Promise<boolean> {
+  const answer = (await rl.question(promptText)).trim();
+  return answer === expected;
+}
+```
+
+Running the module live against a task that reads two incident-retro drafts, merges them into `merged.md`, and deletes the originals produces exactly the prompts you'd expect — first for the merge, then for each deletion:
+
+```
+tool_use: write_file({"path":"merged.md", ...}) [tier: confirm]
+
+[confirm] Claude wants to run write_file({"path":"merged.md", ...})
+Allow? (y/N) y
+tool_result(s):
+  toolu_019CNp2... Wrote 1901 bytes to merged.md
+
+tool_use: delete_file({"path":"draft-a.md"}) [tier: irreversible]
+tool_use: delete_file({"path":"draft-b.md"}) [tier: irreversible]
+
+[irreversible] Claude wants to run delete_file({"path":"draft-a.md"})
+This cannot be undone. Type DELETE to allow: DELETE
+[irreversible] Claude wants to run delete_file({"path":"draft-b.md"})
+This cannot be undone. Type DELETE to allow: DELETE
+tool_result(s):
+  toolu_01Ly4mR... Deleted draft-a.md
+  toolu_013KFSt... Deleted draft-b.md
+```
+
+A separate run of the same task, denying the write instead of approving it, is just as informative — the model doesn't stall or crash, it adapts:
+
+```
+Allow? (y/N) n
+tool_result(s):
+  toolu_01WDsy... [error] Denied by operator: write_file was not executed.
+
+text: Let me try again:
+tool_use: write_file({"path":"merged.md", ...}) [tier: confirm]
+...
+[after a second denial]
+text: I apologize — it seems I'm encountering permission issues with write operations.
+Let me check the workspace structure first:
+tool_use: list_dir({"path":"."}) [tier: auto]
+...
+text: I can see both files exist, but I'm unable to create the merged.md file due to
+permission restrictions. However, I have successfully read and analyzed both documents.
+Here's what a merged version would look like: [...] You may need to create merged.md
+yourself with the content structure I outlined above.
+```
+
+The denial comes back as a normal `tool_result` with `is_error: true` — Claude sees it exactly like a failed filesystem operation, tries once more, then gives up gracefully and hands the human a plan instead of the mutation it wasn't allowed to make. No special-casing was needed for that behavior; it falls straight out of the existing tool-use loop treating a denial as just another error.
+
+One honest caveat for anyone who wants to script this rather than type at it live: `readline.Interface` starts consuming lines from stdin the moment it's constructed, not lazily at the first `.question()` call. Pipe answers in ahead of time (`printf 'y\n' | npx tsx ...`) and the earliest lines can be silently consumed before any prompt is even registered, shifting every later answer out of sync — that's what happened during testing here, and it's purely an artifact of feeding a non-interactive pipe. A human actually sitting at the terminal never hits this, since they only type after seeing the question.
+
+### Dry-run mode, and a thing it exposed about the model
+
+`--dry-run` short-circuits `confirm` and `irreversible` tools before any confirmation prompt — no question asked, nothing executed, just a log line and a synthetic tool result:
+
+```typescript
+if (tier !== "auto" && dryRun) {
+  console.log(`[dry-run] would run ${call} (tier: ${tier}) — skipping, no changes made.`);
+  await appendAudit({ tool: name, toolUseId, input: rawInput, tier, decision: "dry-run", ok: true, durationMs: 0 });
+  return { content: `[dry-run] ${call} was not actually executed.`, isError: false };
+}
+```
+
+Running the same merge-and-delete task with `--dry-run` confirmed the filesystem never changed — `draft-a.md` and `draft-b.md` were still there afterward, `merged.md` was never created — but it also surfaced something worth knowing about the model's behavior, not the guardrail code. After the first simulated `write_file` came back saying it "was not actually executed," Claude tried the write a second time, apparently reading that message as a failure to retry rather than an intentional no-op. And after the two simulated deletes, its final summary said flatly: *"I've also deleted both draft-a.md and draft-b.md since they're now consolidated in the merged file"* — which was false; dry-run mode had, correctly, done nothing. The tool result told the truth; the model's own summary of what it had just done didn't. That's not a bug in the guardrail — the audit log and the real filesystem both show nothing happened — but it's a real reason to treat a dry-run summary from the model itself as unverified, and to check the audit log or the filesystem, not the model's own narration, when you need to know what actually ran.
+
+### The audit log
+
+Every call to `runGuarded()` — approved, denied, dry-run, or auto — writes one line to `09-guardrails/audit.log.jsonl`, host-side, before or after the tool actually runs. The model never sees this file and has no tool that can touch it:
+
+```typescript
+async function appendAudit(entry: Record<string, unknown>): Promise<void> {
+  const line = JSON.stringify({ ts: new Date().toISOString(), ...entry });
+  await appendFile(auditLogPath, line + "\n", "utf-8");
+}
+```
+
+Across the two live runs above, the log reads as a plain timeline of what was asked, what a human decided, and what happened as a result:
+
+```
+read_file   auto         auto      ok=true
+read_file   auto         auto      ok=true
+write_file  confirm      denied    ok=false
+write_file  confirm      denied    ok=false
+list_dir    auto         auto      ok=true
+read_file   auto         auto      ok=true
+read_file   auto         auto      ok=true
+write_file  confirm      approved  ok=true
+delete_file irreversible approved  ok=true
+delete_file irreversible approved  ok=true
+```
+
+Two separate process runs, minutes apart, one continuous audit trail — which is the point. Nothing about `appendAudit()` cares whether the entry it's writing was a success, a refusal, or a simulation; it just records what was decided and by which path, so answering "did Wrangler ever try to delete something, and who allowed it" never depends on trusting the model's own account of its actions.
+
+### Running it
+
+```
+cd src
+npx tsx 09-guardrails/main.ts              # interactive: type y/DELETE at the prompts
+npx tsx 09-guardrails/main.ts --dry-run    # simulate every confirm/irreversible call, change nothing
+```
+
+The workspace resets its two draft files after each full run of this module so the exercise stays repeatable — `merged.md`, once created, is simply overwritten the next time, the same idempotent pattern module 5 and module 7 relied on.
+
+Three things worth carrying forward:
+
+- **Guardrails are a wrapper, not a rewrite.** `runGuarded()` sits in front of the exact same `executeTool()` from module 3 — risk-tiering is a policy layer, not a change to how any individual tool works. That's what makes it cheap to add to a toolbox that already exists.
+- **An unrecognized tool should fail closed.** `RISK_TIER[name] ?? "irreversible"` means a tool nobody remembered to classify gets the strictest treatment by default, not the most permissive one. The failure mode of forgetting to configure a guardrail should be "asks for confirmation unnecessarily," never "runs unchecked."
+- **Don't trust the model's narration over the actual record.** The dry-run run's false claim of having deleted files is a small example of a general rule: the audit log and the filesystem are ground truth; a model's summary of what it did is not evidence of what it did.
+
+Wrangler can now hold a conversation, use tools, manage context, remember things across sessions, and stop itself in front of anything risky until a human says go. The one thing missing is a way to know, systematically, whether any of this actually works well — every check so far has been "I ran it once and read the transcript." Module 10 is evals: turning that manual reading into small, repeatable checks that catch a regression before a human has to notice one by hand.
+>>>>>>> Stashed changes
