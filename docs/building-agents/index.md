@@ -1000,8 +1000,6 @@ Four things worth carrying forward:
 - **A compaction call is a fork, and forks must match their parent's prefix exactly.** Reusing the same `system`, `tools`, and `model` for the summarization request isn't a style preference — it's what lets that one-off call read the cache the main loop already built instead of paying to rebuild it.
 
 Wrangler can now run for a long time without its own transcript becoming the bottleneck. What it still can't do is remember anything once the process exits — every module so far has lived and died with a single `npx tsx` invocation. Module 8 is memory: giving Wrangler a way to carry facts, preferences, and progress across separate runs, not just across turns within one.
-<<<<<<< Updated upstream
-=======
 
 ## Module 8 — Memory: carrying facts across separate runs
 
@@ -1246,4 +1244,3 @@ Three things worth carrying forward:
 - **Don't trust the model's narration over the actual record.** The dry-run run's false claim of having deleted files is a small example of a general rule: the audit log and the filesystem are ground truth; a model's summary of what it did is not evidence of what it did.
 
 Wrangler can now hold a conversation, use tools, manage context, remember things across sessions, and stop itself in front of anything risky until a human says go. The one thing missing is a way to know, systematically, whether any of this actually works well — every check so far has been "I ran it once and read the transcript." Module 10 is evals: turning that manual reading into small, repeatable checks that catch a regression before a human has to notice one by hand.
->>>>>>> Stashed changes
