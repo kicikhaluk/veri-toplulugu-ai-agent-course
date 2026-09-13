@@ -183,7 +183,7 @@ while (true) {
     messages,
   });
 
-  // Dump the raw response so you can see the actual shape the API returns —
+  // Log the raw response so that we can see the actual shape the API returns
   // id, model, stop_reason, usage, and the content block array — not just
   // the parts we bother to summarize.
   console.log("\n=== response ===");
@@ -323,14 +323,14 @@ Everything else in this course is this same shape: a `while` loop, a `tools` arr
 
 The loop from Module 2 doesn't change at all here. What changes is what's inside the `tools` array and the `executeTool` dispatcher — and, for the first time, a tool input that names a path is something you have to actively defend against, not just cast and trust.
 
-`calculate` could never do damage: worst case it returns the wrong number. A `read_file`/`write_file` tool can be asked — by an adversarial prompt, or just a confused user typing a bad relative path — to touch a file well outside where you meant to let the agent operate. So Module 3 introduces the pattern every filesystem tool in this course uses from here on: **confine every path to a workspace root, and resolve every model-supplied path through one guard function before it ever reaches `fs`.**
+`calculate` could never do damage: worst case it returns the wrong number. A `read_file`/`write_file` tool can be asked — by an adversarial prompt, or just a confused user typing a bad relative path — to touch a file well outside where you meant to let the agent operate. So Module 3 introduces the pattern every filesystem tool in this course uses from here on: **limit every path to a workspace root, and resolve every model-supplied path through one guard function before it ever reaches `fs`.**
 
 ### The sandbox root and the guard
 
 ```typescript
 import * as path from "node:path";
 
-// Everything the model touches is confined to this directory. No tool below
+// Everything the model touches is limited to this directory. No tool below
 // ever uses a path the model gives us without resolving it through
 // resolveSafePath() first.
 const workspaceRoot = path.resolve(import.meta.dirname, "workspace");

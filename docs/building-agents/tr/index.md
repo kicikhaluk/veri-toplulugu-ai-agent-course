@@ -320,3 +320,209 @@ Artık bu yapıdan doğrudan okuyabileceğimiz, bir varsayım olarak kabul etmek
 - **Loop, tek değil üç round trip çalıştı**: çarpma × 2 → toplama → son cevap. `if` değil de `while (true)` kullanmamızın sebebi de bu. Tool kullanan bir tur, konuşmanın sonu değildir; Claude'un konuşmayı bitirebilmek için bilgi istemesidir. `messages` sonunda altı öğe uzunluğuna ulaşır — sorunuz, üç asistan turu ve iki `tool_result` cevabı — ve her öğe, loop yaşadığı sürece array içinde kalıp her seferinde tam olarak yeniden gönderilir.
 
 Bu kursun geri kalanı da aynı şekle sahip: bir `while` loop'u, bir `tools` array'i, bir dispatcher. Modül 3 de, hesap makinesinin yerine gerçek dosyalara dokunan dosya sistemi tool'larını göreceğiz ve "modelin girdisine güven" yaklaşımının artık yetmemeye başladığı yer de tam olarak burası.
+
+## Modül 3 — Dosya sistemi tool'ları ve bir sandbox koruması
+
+Modül 2'deki loop burada hiç değişmiyor. Değişen şey `tools` array'inin ve `executeTool` dispatcher'ının içeriği. İlk kez, path belirten tool girdisi, basitçe varsayılıp güvenilecek bir şey değil, önlem almamız gereken bir şey haline geliyor.
+
+`calculate` en kötü ihtimalle yanlış bir sayı döndürürdü. Bir `read_file`/`write_file` tool'undan ise — kötü niyetli bir prompt tarafından, ya da sadece kötü bir relative path yazan bir kullanıcı tarafından — agent'ın çalışmasını amaçladığınız alanın dışındaki bir dosyaya dokunması istenebilir. Bu yüzden Modül 3, bu kurstaki her dosya sistemi tool'unun kullandığı deseni içeriyor: **her yolu bir workspace ile sınırlayın ve modelin verdiği her yolu, `fs`'e ulaşmadan önce tek bir guard fonksiyonundan geçirerek çözümleyin.**
+
+### Sandbox kökü ve guard
+
+```typescript
+import * as path from "node:path";
+
+// Everything the model touches is limited to this directory. No tool below
+// ever uses a path the model gives us without resolving it through
+// resolveSafePath() first.
+const workspaceRoot = path.resolve(import.meta.dirname, "workspace");
+
+function resolveSafePath(relativePath: string): string {
+  const target = path.resolve(workspaceRoot, relativePath);
+  if (target !== workspaceRoot && !target.startsWith(workspaceRoot + path.sep)) {
+    throw new Error(`"${relativePath}" resolves outside the workspace root — refusing.`);
+  }
+  return target;
+}
+```
+
+`import.meta.dirname`, `"type": "module"` bir projede sahip olmadığınız `__dirname`'in ESM karşılığıdır. Herhangi bir `fileURLToPath` boilerplate'ine gerek kalmadan mevcut dosyanın bulunduğu dizini verir.
+
+Modelin verdiği yolu `path.resolve` ile kök dizine *göre* çözümleyip, sonra sonucun hâlâ bu dizinle başlayıp başlamadığını kontrol edeceğiz. `path.resolve("workspace", "../secrets.txt")`, `workspace`'in içinde kalmaz — `startsWith` kontrolünün yakaladığı durum tam olarak bu. Aşağıdaki dört tool'un her biri, diske dokunmadan önce `resolveSafePath`'i çağırır. Hiçbiri kendi başına path oluşturmaz.
+
+### Tip doğrulaması
+
+Modül 2 de, `tool_use.input`'u doğrudan beklediği şekle cast edip ileriye ertelenmiş bir problem olarak bırakmıştık. Hatalı bir kullanım yanlış bir dosyaya yazmak anlamına gelebileceğinden, o cast'in yerini gerçek bir runtime kontrolüne bırakıyoruz.
+
+```typescript
+function expectString(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`Expected "${field}" to be a string, got ${typeof value}`);
+  }
+  return value;
+}
+```
+
+Her tool fonksiyonu, kendi alanlarını destructure edip umut etmek yerine `expectString` üzerinden (ya da başka tipler için yazacağımız benzer bir fonksiyon üzerinden) okur. Küçük bir fonksiyon ama "model hatalı bir `tool_use.input` gönderdi" hatasını hızlı şekilde fırlatıp aksiyon almamızı sağlıyor.
+
+### Dört tool, tek dispatcher, hatalar throw edilmez — raporlanır
+
+```typescript
+const tools: Anthropic.Tool[] = [
+  {
+    name: "list_dir",
+    description: "List the files and directories at a path inside the workspace. Use \".\" for the workspace root.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Directory to list, relative to the workspace root." },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "read_file",
+    description: "Read the full text contents of a file inside the workspace.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File to read, relative to the workspace root." },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "write_file",
+    description: "Create a file inside the workspace, or overwrite it if it already exists. Creates parent directories as needed.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File to write, relative to the workspace root." },
+        content: { type: "string", description: "The full contents to write." },
+      },
+      required: ["path", "content"],
+    },
+  },
+  {
+    name: "edit",
+    description:
+      "Replace one exact occurrence of old_str with new_str in an existing file. old_str must match exactly, including whitespace, and must be unique in the file — include enough surrounding context to make it so.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File to edit, relative to the workspace root." },
+        old_str: { type: "string", description: "Exact text to find. Must occur exactly once in the file." },
+        new_str: { type: "string", description: "Text to replace it with." },
+      },
+      required: ["path", "old_str", "new_str"],
+    },
+  },
+];
+```
+
+`edit`, bilinçli olarak Claude Code'un kendisinin kullandığı find-and-replace tool'u model alınarak tasarlandı: `old_str` tam olarak bir kez eşleşmeli. Bu şart modelin hangi eşleşmenin kastedildiğini teyit etmek için dosyanın tamamını yeniden okumasına gerek kalmadan bir edit'i güvenle uygulanabilir kılar.
+
+Tool implementasyonları (`list_dir`, `read_file`, `write_file`, `edit`), her biri yolunu `resolveSafePath`'ten geçirir, tek bir `node:fs/promises` çağrısı yapar ve bir string döner. Gerçek bir mantığa sahip olan tek tool `edit`: `original.split(oldStr).length - 1` ile `old_str`'nin kaç kez geçtiğini sayar ve bu sayı tam olarak 1 değilse devam etmeyi reddeder.
+
+Yeni olan şey dispatcher. Dosya sistemi çağrıları sıradan sebeplerle başarısız olur — eksik bir dosya, bir guard reddi, benzersiz olmayan bir `old_str` ve bu muhtemel hatalar loop'u çökertecek bir sebep değil, modelin üzerine aksiyon alabileceği bilgilerdir.
+
+```typescript
+async function executeTool(name: string, input: unknown): Promise<{ content: string; isError: boolean }> {
+  try {
+    switch (name) {
+      case "list_dir":
+        return { content: await listDir(input), isError: false };
+      case "read_file":
+        return { content: await readFileTool(input), isError: false };
+      case "write_file":
+        return { content: await writeFileTool(input), isError: false };
+      case "edit":
+        return { content: await editFile(input), isError: false };
+      default:
+        return { content: `Error: no such tool "${name}"`, isError: true };
+    }
+  } catch (err) {
+    return { content: err instanceof Error ? err.message : String(err), isError: true };
+  }
+}
+```
+
+Ve loop'un kendisindeki tek değişiklik — `tool_result` blokları API'de `is_error` alanı taşıyor ve bu bizim kodumuz kontrolünde olan bir değer.
+
+```typescript
+const toolResults: Anthropic.ToolResultBlockParam[] = [];
+for (const block of toolUseBlocks) {
+  const { content, isError } = await executeTool(block.name, block.input);
+  toolResults.push({
+    type: "tool_result",
+    tool_use_id: block.id,
+    content,
+    is_error: isError,
+  });
+}
+```
+
+`is_error: true`, loop'u durdurmaz ya da sizin tarafınızda bir hata fırlatmaz — bu, *Claude'a* verilen bir sinyaldir: bu sonuç bir hataya sebep oldu, bu yüzden mesajı okuyup bir hata string'ini normal bir sonuç sanmak yerine ne yapacağına (başka bir yol denemek, size sormak, zarifçe pes etmek) modelin kendisi karar verebilir.
+
+Bu kodun tamamı `src/03-filesystem/main.ts` içinde, `src/03-filesystem/workspace/` altındaki küçük bir sandbox'a karşı çalışıyor (demo için oraya bir `notes.txt` ve bir `todo.md` yerleştirilmiş durumda). Çalıştırmak için:
+
+```bash
+cd src
+npx tsx 03-filesystem/main.ts
+```
+
+### Guard'ın gerçekten devreye girdiğini görmek
+
+Demo prompt'u agent'tan workspace'i listelemesini, `notes.txt`'yi okumasını, `todo.md`'yi düzenlemesini ve ardından — "sadece ne olacağını görmek için" — workspace in bir *üstündeki* dosyada var olan `../secrets.txt`'yi okumasını ister. (var olduğu için burada bir engelleme, eksik dosya hatası değil, kanıtlanabilir şekilde guard'ın işidir).
+
+```
+=== response ===   (first turn: list_dir + read_file, run in parallel)
+content: [
+  { type: 'text', text: "I'll help you with that. Let me start by listing the workspace contents and reading notes.txt." },
+  { type: 'tool_use', name: 'list_dir', input: { path: '.' }, ... },
+  { type: 'tool_use', name: 'read_file', input: { path: 'notes.txt' }, ... }
+]
+stop_reason: 'tool_use'
+```
+
+...ikinci bir round doğru ekleme noktasını bulmak için `todo.md`'yi okuyor, sonra üçüncü round, tam olarak okumaya değer olan:
+
+```
+=== response ===
+content: [
+  { type: 'text', text: 'Perfect! Now I'll add the new line after "- Write filesystem tools" and then try to read ../secrets.txt.' },
+  {
+    type: 'tool_use',
+    name: 'edit',
+    input: {
+      path: 'todo.md',
+      old_str: '- Set up the loop\n- Write filesystem tools',
+      new_str: '- Set up the loop\n- Write filesystem tools\n- Ship module 3'
+    }
+  },
+  { type: 'tool_use', name: 'read_file', input: { path: '../secrets.txt' } }
+]
+stop_reason: 'tool_use'
+
+=== tool_result(s) sent back ===
+[
+  { type: 'tool_result', tool_use_id: '...', content: 'Replaced 1 occurrence in todo.md', is_error: false },
+  {
+    type: 'tool_result',
+    tool_use_id: '...',
+    content: '"../secrets.txt" resolves outside the workspace root — refusing.',
+    is_error: true
+  }
+]
+```
+
+Claude, edit'i ve sınır dışına çıkan okumayı tek seferde toplu olarak gönderdi. Hangisinin başarısız ve ya başarılı olacağını bilmesinin baska bir yolu yok. Guard tam olarak işini yaptı: `read_file`, o path için `fs`'e hiç dokunmadı bile, `resolveSafePath` daha önce hata fırlattı ve hata, `is_error: true` ile normal bir `tool_result` olarak geri döndü. Son turda (`stop_reason: 'end_turn'`) Claude, hiçbir şey sorulmadan bu reddi  düz bir dille raporladı. Context'inde duran başarısız bir tool çağrısı model tarafından bu şekilde ele alınır. Tam ID'leri ve sonuçların tamamını görmek için çalıştırabilirsiniz.
+
+Bu modülden hatırlamamız gereken dört şey:
+
+- **Guard tam olarak tek bir fonksiyonda yer alıyor.** Her tool `resolveSafePath` üzerinden geçiyor. Denetlenecek bir çok yer değil, tek bir yer var. Modül 4, gerçek komut çalıştıran bir `bash` tool'u eklediğinde, baştan yazacağımız değil, tekrar kullanacağımız desen bu olacak.
+- **Reddedilen bir sonuç, loop'u çökertmenize izin verdiğiniz bir exception değildir.** Başarılı bir sonuçla aynı şekle sahip, `is_error: true` olan bir `tool_result`'tır ve modelin konuşma içinde tepki verebilmesi için geri gönderilir.
+- **Runtime girdi doğrulaması artık zorunlu.** `expectString` çok basit bir fonksiyon, ama "modelden gelen rastgele JSON"un "`path.resolve`'a güvenle verebileceğiniz bir string"e dönüştüğü sınır tam olarak burası.
+- **Modele `../secrets.txt`'yi denememesi söylenmesine gerek yoktu — yine de denedi, çünkü biz ona söyledik ("sadece ne olacağını görmek için").** Gerçek bir agent'ta bu merak kendini bir test olarak duyurmaz; sınırların dışına çıkan, sıradan görünen bir yol olarak karşınıza çıkar. Guard, modelin niyeti kötü ve ya iyi olsun, aynı şekilde tutmak zorundadır.
+
+Modül 4 de, aynı guard'ı ve aynı `is_error` yapısını kullanarak ve bir agent'ı gerçek bir projede gerçekten kullanışlı hissettiren tool'ları ele alacak. Bir arama/grep tool'u ve bir allowlist arkasına gizlenmiş bir `bash` tool'u — ki paralel tool kullanımının bir merak konusu olmaktan çıkıp aktif olarak düşünmemiz gereken bir şey haline geldiği yer de tam olarak burası.
