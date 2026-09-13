@@ -4,15 +4,17 @@ title: Building an Agent from Scratch with Claude
 permalink: /building-agents/
 ---
 
-Building an agent from scratch with Claude: the agentic loop, evals, and tool use — no framework, just the Claude API and TypeScript.
+*[Türkçe](tr/)*
 
-By the end of this course you'll have **Wrangler**, a general-purpose local agent that lives in a scoped workspace directory and can read/write/grep files, run shell commands behind an approval gate, search the web, execute code, and hand off browser-shaped tasks. Every module adds one capability to the same agent — nothing here is a toy example you throw away.
+Building an agent from scratch with Claude: the agentic loop, evals, and tool use, context management, memory, guardrails — no framework, just the Claude API and TypeScript.
 
-All code lives in `src/` in this repository, one numbered folder per module, sharing a single `npm` project.
+By the end of this course you'll have **Wrangler**, a general-purpose local agent that lives in a scoped workspace directory and can read/write/grep files, run shell commands behind an approval gate, search the web, execute code, and hand off browser-shaped tasks. Every module adds one capability to the same agent.
+
+All code lives in `src/` in this repository, one numbered folder per module, sharing a single `nodejs` project.
 
 ## Requirements
 
-- Node.js 20+ (the examples were written against Node 24)
+- Node.js 20+ (the examples were written with using Node v24)
 - An Anthropic API key, kept in a `.env` file — never commit it. Copy the template and fill in your key:
 
   ```bash
@@ -27,10 +29,10 @@ All code lives in `src/` in this repository, one numbered folder per module, sha
 
 Every agent, no matter how sophisticated, is built from five primitives:
 
-- **Model** — the thing that reasons and decides. Claude, reached through a single API endpoint (`POST /v1/messages`).
-- **Tools** — named, schema-described actions the model can request. The model never executes anything itself; it emits a request, your code executes it.
+- **Model** — the thing that reasons and decides. Claude reached through a single API endpoint.
+- **Tools** — named, schema-described actions the model can request. The model never executes anything itself; it emits a request, **your code executes** it.
 - **History** — the list of messages (user turns, assistant turns, tool calls, tool results) that gets resent on every request. The API is stateless — the *conversation* is a value you own, not something the server remembers for you.
-- **Memory** — state that outlives a single conversation (as opposed to history, which lives only within one). We'll get here in Module 8.
+- **Memory** — state that outlives a single conversation. We'll get here in Module 8.
 - **Orchestration** — the loop: send messages, inspect the response, run any requested tools, feed results back, decide whether to stop. This loop is the actual "agent" — everything else is plumbing around it.
 
 This course builds the orchestration loop by hand first, so you can see exactly what a framework would otherwise hide from you.
@@ -41,6 +43,13 @@ From the repository root:
 
 ```bash
 cd src
+npm i
+```
+
+If you would like to set up a new project from scratch:
+
+```bash
+# at the root of your new project folder
 npm init -y
 npm install @anthropic-ai/sdk dotenv
 npm install -D typescript tsx @types/node
@@ -49,7 +58,7 @@ npm install -D typescript tsx @types/node
 - `@anthropic-ai/sdk` — the official Anthropic TypeScript SDK. We call the Messages API through it directly; no agent framework.
 - `dotenv` — loads `ANTHROPIC_API_KEY` (and later, other config) from a local `.env` file into `process.env`, so you never type a key into your shell history or hardcode it in source.
 - `typescript` + `@types/node` — type checking.
-- `tsx` — runs `.ts` files directly, no separate build step, which keeps each module a single runnable file.
+- `tsx` — runs `.ts` files directly, no separate build step, which keeps each module a single runnable file. Enough for the course.
 
 Set `"type": "module"` in `src/package.json` (we'll write ESM throughout) and add a `tsconfig.json`:
 
@@ -101,7 +110,7 @@ cd src
 npx tsx 01-first-call/main.ts
 ```
 
-**Why Haiku 4.5, not a bigger model?** Every module in this course makes several requests while you iterate — this is a course about the *loop*, not about squeezing maximum reasoning out of one call. Claude Haiku 4.5 is fast and inexpensive, so you can re-run examples freely without worrying about cost. Everything we build is model-agnostic: once Wrangler is done, swap `model: "claude-haiku-4-5"` for `model: "claude-opus-5"` anywhere you want more capable reasoning (tool selection on ambiguous tasks, longer agentic runs) at a higher cost per token.
+**Why Haiku 4.5, not a bigger model?** Every module in this course makes several requests while you iterate — this is a course about the *loop*, not about squeezing maximum reasoning out of one call. Claude Haiku 4.5 is fast and inexpensive, so you can re-run examples freely without worrying much about cost. Overall probably you will spend some peny not dollars. Everything we build is model-agnostic: once Wrangler is done, swap `model: "claude-haiku-4-5"` for `model: "claude-opus-5"` anywhere if you would like to have more capable reasoning (tool selection on ambiguous tasks, longer agentic runs) at a higher cost per token.
 
 A few things worth noticing before we move on, because they explain the shape of everything that follows:
 
@@ -174,7 +183,7 @@ while (true) {
     messages,
   });
 
-  // Dump the raw response so you can see the actual shape the API returns —
+  // Log the raw response so that we can see the actual shape the API returns
   // id, model, stop_reason, usage, and the content block array — not just
   // the parts we bother to summarize.
   console.log("\n=== response ===");
@@ -314,14 +323,14 @@ Everything else in this course is this same shape: a `while` loop, a `tools` arr
 
 The loop from Module 2 doesn't change at all here. What changes is what's inside the `tools` array and the `executeTool` dispatcher — and, for the first time, a tool input that names a path is something you have to actively defend against, not just cast and trust.
 
-`calculate` could never do damage: worst case it returns the wrong number. A `read_file`/`write_file` tool can be asked — by an adversarial prompt, or just a confused user typing a bad relative path — to touch a file well outside where you meant to let the agent operate. So Module 3 introduces the pattern every filesystem tool in this course uses from here on: **confine every path to a workspace root, and resolve every model-supplied path through one guard function before it ever reaches `fs`.**
+`calculate` could never do damage: worst case it returns the wrong number. A `read_file`/`write_file` tool can be asked — by an adversarial prompt, or just a confused user typing a bad relative path — to touch a file well outside where you meant to let the agent operate. So Module 3 introduces the pattern every filesystem tool in this course uses from here on: **limit every path to a workspace root, and resolve every model-supplied path through one guard function before it ever reaches `fs`.**
 
 ### The sandbox root and the guard
 
 ```typescript
 import * as path from "node:path";
 
-// Everything the model touches is confined to this directory. No tool below
+// Everything the model touches is limited to this directory. No tool below
 // ever uses a path the model gives us without resolving it through
 // resolveSafePath() first.
 const workspaceRoot = path.resolve(import.meta.dirname, "workspace");

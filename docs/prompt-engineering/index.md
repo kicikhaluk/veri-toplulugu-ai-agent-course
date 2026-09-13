@@ -4,6 +4,8 @@ title: Prompt Engineering ve Teknikleri
 permalink: /prompt-engineering/
 ---
 
+*[English](en/)*
+
 # Prompt Engineering ve Teknikleri
 
 **Prompt engineering**, bir yapay zeka modeline istediğimiz sonucu doğru, tutarlı ve kullanılabilir şekilde ürettirebilmek amacıyla yazdığımız etkili direktif süreci. 

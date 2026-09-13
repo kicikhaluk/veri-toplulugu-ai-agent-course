@@ -8,7 +8,6 @@ An educational course (in progress) covering three topics, each with its own sec
 
 - Prompt Engineering and Techniques (`docs/prompt-engineering/`)
 - Building an Agent from Scratch with Claude — agentic loop, evals, tool use (`docs/building-agents/`)
-- AI-Native Teams (`docs/ai-native-teams/`)
 
 `src/` is a placeholder for code examples the course will reference; it currently contains only a README and no code.
 

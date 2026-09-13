@@ -1,7 +1,7 @@
-title: Veri Topluluğu AI Agent
+title: Building AI agent from scratch
 description: >-
-  A course on prompt engineering, building AI agents from scratch with Claude,
-  and an introduction to AI-native teams.
+  A course on prompt engineering, and building AI agents from scratch with Claude. /
+  Prompt mühendisliği ve Claude ile sıfırdan yapay zeka ajanları geliştirme üzerine bir kurs.
 theme: jekyll-theme-cayman
 show_downloads: false
 
