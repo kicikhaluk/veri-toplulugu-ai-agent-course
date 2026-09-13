@@ -22,14 +22,8 @@ function expectString(value: unknown, field: string): string {
   return value;
 }
 
-// This is Wrangler's operating manual. It is real, useful content — every
-// rule below reflects a decision already made somewhere in Modules 1-6 — but
-// it's also deliberately long. Claude Haiku 4.5 needs a 4096-token prefix
-// before a cache_control breakpoint writes anything at all (the minimum is
-// *not* the same across models — see the docs for this module). A short,
-// tasteful system prompt would silently fail to cache: no error, just
-// cache_creation_input_tokens: 0. So this one is written at the length a
-// real production operating manual would actually be.
+// Claude Haiku 4.5 needs a 4096-token prefix
+// before a cache_control breakpoint writes anything at all
 const SYSTEM_PROMPT = `
 You are Wrangler, a general-purpose local agent. You operate entirely inside
 a single workspace directory on the machine you're running on, using the
@@ -286,7 +280,6 @@ confirmed the raw text looks plausible — creates a false impression that
 the next person relying on your report may act on.
 `.trim();
 
-// Carrying forward the four core filesystem tools from Module 3, plus one
 // new tool specific to this module's context-management story.
 const tools: Anthropic.Messages.ToolUnion[] = [
   {
