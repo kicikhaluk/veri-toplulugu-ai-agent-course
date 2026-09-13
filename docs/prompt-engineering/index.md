@@ -37,7 +37,7 @@ Diğer tüm teknikler aslında standard prompt'un eksiklerini (belirsizlik, form
 E-ticaret sitesindeki "sepete ürün ekleme" özelliğini ele alalım.
 
 ```
-ACME e ticaret sitemiz'e sepete ürün ekleme özeliği için bir user story yaz.
+ACME e-ticaret sitemiz'e sepete ürün ekleme özeliği için bir user story yaz.
 ```
 
 **Format**
@@ -47,7 +47,7 @@ ACME e ticaret sitemiz'e sepete ürün ekleme özeliği için bir user story yaz
 - Acceptance criteria isteniyor mu?
 - İşletmeye muhtemel katacağı değerden bahsetmek gerekir mi?
 
-Standart prompt hızlı bir taslak için yeterli olabilir, ama kullanılabilir, tekrarlanabilir bir sonuç için genelde yetersizdir. 
+Standart prompt hızlı bir taslak için yeterli olabilir, ama kullanılabilir, tekrarlanabilir bir sonuç için genelde istediğimiz yeterlilikteki çıktıları alamayabiliriz. 
 
 ---
 
@@ -71,9 +71,9 @@ Bir e-ticaret platformunda "iade süreci" için iş gereksinimleri (business req
 
 ## 3. One-Shot Prompting {#one-shot}
 
-Modele amacı tarif ettikten sonra, tam olarak istediğimiz formatı/üslubu gösteren **tek bir örnek** vermektir. Model bu örneği referans alarak yeni bir çıktı üretir.
+Modele amacı tarif ettikten sonra, tam olarak istediğimiz formatı gösteren **tek bir örnek** vermektir. Model bu örneği referans alarak yeni bir çıktı üretir.
 
-Format veya üslup önemli olduğunda ama tek bir örneğin yeterli olacağı, görevin çok karmaşık olmadığı durumlarda kullanılır.
+Tek bir örnekle, yapay zekaya istedğimiz formatı aktarabileceğimiz, görevin çok karmaşık olmadığı durumlarda kullanılır.
 
 **Örnek — QA Engineer/Tester:**
 
@@ -97,9 +97,9 @@ Yeni senaryo konusu: Süresi dolmuş bir kupon kodu ile ödeme yapılmaya çalı
 
 ## 4. Few-Shot Prompting {#few-shot}
 
-One-shot'un bir adım ötesi: modele **birden fazla (genelde 2-5) örnek** vererek hem formatı hem de örnekler arasındaki **kalıbı/mantığı** öğretmektir. Örnek sayısı arttıkça model, istenen kalıbı daha güvenilir şekilde yakalar; özellikle örnekler arasında ince farklar (ör. farklı senaryolar, edge-case) varsa few-shot, one-shot'tan daha tutarlı sonuç verir.
+One-shot'un bir adım ötesi: modele **birden fazla (genelde 2-5) örnek** vererek hem formatı hem de örnekler arasındaki **kalıbı/mantığı** öğretmektir. Örnek sayısı arttıkça model, istenen kalıbı daha güvenilir şekilde yakalar. Özellikle örnekler arasında ince farklar (ör. farklı senaryolar, edge-case) varsa few-shot, one-shot'tan daha tutarlı sonuç verir. Burada önemli olan verdiğimiz örneklerin çeşitliliği ve kalitesi.
 
-Amaç tek bir örnekle tam olarak tarif edilemeyecek kadar çeşitlilik içeriyorsa (farklı durumlar, farklı ton/üslup varyasyonları) few-shot tercih edilir.
+Amaç tek bir örnekle tam olarak tarif edilemeyecek kadar çeşitlilik içeriyorsa (farklı durumlar, farklı ton/üslup varyasyonları) few-shot tercih edilebilir.
 
 **Örnek — Developer:**
 
@@ -128,7 +128,7 @@ Kod: function getDiscount(price) { return price - (price * 0.1) }
 
 ## 5. Structured Output {#structured-output}
 
-Modelden serbest metin yerine **belirli bir formatta** (JSON, tablo, YAML, Markdown listesi vb.) çıktı istemektir. Bu, çıktının bir sonraki adımda otomatik olarak işlenmesi (bir sisteme aktarılması, bir dashboard'a beslenmesi) gerektiğinde kritik önem taşır.
+Modelden serbest metin yerine **belirli bir formatta** (JSON, tablo, YAML, Markdown listesi, User Story formatı vb.) çıktı istemektir. Bu, çıktının bir sonraki adımda otomatik olarak işlenmesi (bir sisteme aktarılması, bir dashboard'a beslenmesi) gerektiğinde kullanabilecek değerli bir teknik. 
 
 **Örnek — Delivery Manager:**
 
@@ -158,7 +158,7 @@ Bilgiler:
 
 ## 6. Chain of Thought {#chain-of-thought}
 
-Modelden, doğrudan son cevabı vermek yerine **adım adım düşünerek** (lets think step by step) sonuca ulaşmasını istemektir. "Adım adım düşün", "önce seçenekleri listele, sonra karşılaştır, sonra karar ver" gibi talimatlar bu tekniğin parçasıdır.
+Modelden, doğrudan son cevabı vermek yerine **adım adım düşünerek** (lets think step by step) sonuca ulaşmasını istemektir. "Adım adım düşün", "önce seçenekleri listele, sonra karşılaştır, sonra karar ver" gibi talimatları bu teknikle birlikte kullabiliriz.
 
 **Örnek — Solution Architect:**
 
@@ -181,15 +181,15 @@ Adım adım düşün:
 4. En son, bu üç değerlendirmeyi birleştirerek gerekçeli bir öneri sun.
 ```
 
-Modelden doğrudan "A mı B mi?" diye sorulsaydı, yüzeysel ve tek boyutlu bir cevap almak yerine adım adım düşünmesini istemek, modelin her bir kriteri ayrı ayrı değerlendirmesini ve daha dengeli, gerekçeli bir sonuca ulaşmasını sağlar. Ayrıca çıktıdaki düşünme adımları, kararı gözden geçirmemizi kolaylaştırabilir.
+Modelden doğrudan "A mı B mi?" diye sorulsaydı, yüzeysel ve tek boyutlu bir cevap alabilirdik. Bunun yerine adım adım düşünmesini istemek, modelin her bir kriteri ayrı ayrı değerlendirmesini, daha dengeli, gerekçeli bir sonuca ulaşmasını sağlar. Ayrıca çıktıdaki düşünme adımları, kararı gözden geçirmemizi kolaylaştırabilir.
 
 ---
 
 ## 7. Delimiters / XML Etiketleri {#delimiters-xml}
 
-Uzun veya çok parçalı bir prompt'ta, farklı bölümleri (bağlam, talimat, veri, örnek) birbirinden ayırmak için `"""`, `---` gibi ayraçlar ya da `<context>...</context>`, `<data>...</data>` gibi XML benzeri etiketler kullanmaktır. Bu, modelin "bu kısım bir talimat mı, yoksa işlenecek veri mi?" karışıklığını yaşamasını engeller.
+Uzun veya çok parçalı bir prompt'ta, farklı bölümleri (bağlam, talimat, veri, örnek) birbirinden ayırmak için `"""`, `---` gibi ayraçlar ya da `<context>...</context>`, `<data>...</data>` gibi XML benzeri etiketler kullanmaktır. Bu, modelin verdiğimiz prompta "bu kısım bir talimat mı, yoksa işlenecek veri mi?" vb. karışıklığını yaşamasını engeller.
 
-Prompt içinde birden fazla bilgi bloğu varsa (örneğin hem talimat hem de üzerinde çalışılacak ham metin) delimiter/XML kullanmak, özellikle uzun promptlarda karışıklığı büyük ölçüde azaltır. Claude, XML etiketlerini özellikle iyi ayırt eder ve bu yüzden bu teknik Claude ile çalışırken sık önerilir.
+Prompt içinde birden fazla bilgi bloğu varsa (örneğin hem talimat hem de üzerinde çalışılacak ham metin) delimiter/XML kullanmak, özellikle uzun promptlarda karışıklığı belirli bir ölçüde azaltabilir. Claude, XML etiketlerini özellikle iyi ayırt eder ve bu yüzden XML, Claude ile çalışırken kullandığımız etiketleme yöntemi. Sadece Antrophic modelleri için geçerli değil. OpenAI, Google, Meta vb sağlayıcıların modellerinde de etkili bir yöntem. Burada önemli olan nokta promptlarla deney yapmak , oynamak sonuçları değerlendirmek. Bu bahsettiğimiz bütün teknikler için geçerli. 
 
 **Örnek — Product Owner:**
 
@@ -214,7 +214,7 @@ ekibi için "As a... I want... So that..." formatında bir user story ve
 3 maddelik bir acceptance criteria listesi yaz.
 ```
 
-`<feedback>` ve `<constraints>` etiketleri, modelin hangi metnin "işlenecek ham veri", hangisinin "uyulması gereken kısıt" olduğunu net şekilde ayırt etmesini sağlar.
+`<feedback>` ve `<constraints>` etiketleri, modelin hangi metnin "işlenecek ham veri", hangisinin "uyulması gereken kısıt" olduğunu ayırt etmesini sağlar.
 
 ---
 
@@ -222,9 +222,9 @@ ekibi için "As a... I want... So that..." formatında bir user story ve
 
 Modele, cevabı üretirken **belirli bir uzmanlık kimliğine bürünmesini** söylemektir ("Sen kıdemli bir güvenlik mühendisisin..."). Bu, modelin cevaplarındaki **bakış açısını, önceliklendirmesini ve kullandığı terminolojiyi** o rolün uzmanlık alanına yönlendirir.
 
-Persona atamak modele gerçek dışı bir yetenek kazandırmaz; model zaten sahip olduğu bilgiyi, istenen rolün bakış açısıyla süzerek sunar. Yani persona, modelin "neye odaklanacağını" ve "hangi tonla konuşacağını" belirler — sihirli bir uzmanlık kaynağı değildir.
+Persona atamak modele gerçek dışı bir yetenek kazandırmaz. Model zaten sahip olduğu bilgiyi, istenen rolün bakış açısıyla süzerek sunar. Yani persona, modelin "neye odaklanacağını" ve "hangi tonla konuşacağını" belirler.Sihirli bir uzmanlık kaynağı değildir.
 
-Belirli bir uzmanlık perspektifinden değerlendirme, risk analizi veya geri bildirim istendiğinde; ya da çıktının belirli bir hedef kitleye (örneğin yöneticilere) uygun tonda olması gerektiğinde kullanılır.
+Belirli bir uzmanlık perspektifinden değerlendirme, risk analizi veya geri bildirim istendiğinde ya da çıktının belirli bir hedef kitleye (örneğin yöneticilere) uygun tonda olması gerektiğinde kullanılabilir.
 
 **Örnek**
 

@@ -1,6 +1,6 @@
 ---
 layout: default
-title: Prompt Engineering and Techniques
+title: Prompt Engineering/Techniques
 permalink: /prompt-engineering/en/
 ---
 
@@ -8,7 +8,7 @@ permalink: /prompt-engineering/en/
 
 # Prompt Engineering and Techniques
 
-**Prompt engineering** is the effective process of instruction-writing that helps get an AI model to produce the outcome we want — accurately, consistently, and in a usable form.
+**Prompt engineering** is the effective process of instruction. Writing that help us to get accurate, consistent outcomes we want from an AI model.
 
 Since AI models are *non-deterministic*, asking the same question in two different ways can produce two answers of very different quality. In this section, we'll go over a few techniques for getting good, consistent results.
 
@@ -28,9 +28,9 @@ Since AI models are *non-deterministic*, asking the same question in two differe
 
 ## 1. Standard Prompt (Plain Prompt) {#standard-prompt}
 
-The technique we all use, often without thinking about it, when talking to an LLM. Standard prompts are usually the short, plain instructions we give an AI assistant.
+The technique we all use when we are talking to an LLM. Most probably you use that at least once a day if you are dealing with AI daily. Standard prompts are usually the short, plain instructions we give an AI assistant.
 
-Every other technique here is really just a tool for fixing the shortcomings of the standard prompt — ambiguity, inconsistent formatting, unpredictable quality.
+Every other technique here is really just a tool for fixing ambiguity, inconsistenty, formatting and unpredictable quality. There is nothing wrong with standard prompts, those are techniques we apply to get desired output depending on cases.
 
 **Example — Product Owner:**
 
@@ -53,9 +53,9 @@ A standard prompt can be enough for a quick draft, but it's usually not enough f
 
 ## 2. Zero-Shot Prompting {#zero-shot}
 
-Zero-shot prompting is really our baseline. Every zero-shot prompt could be called a standard prompt, but not every standard prompt is a zero-shot prompt.
+Zero-shot prompting is kind of our baseline. Every zero-shot prompt could be called a standard prompt, but not every standard prompt is a zero-shot prompt.
 
-When the task is simple and about something the model already knows well — when the model doesn't need an example — zero-shot is usually enough.
+When the task is simple or about something the model already knows well. For the case, if we don't need to provide an example zero-shot will be enough.
 
 **Example — Business Analyst:**
 
@@ -73,7 +73,7 @@ Prepare a business requirements document for the "return process" on an e-commer
 
 After describing the goal to the model, you give it **a single example** that shows exactly the format or style you want. The model uses that example as a reference for producing its own output.
 
-Used when format or style matters, but a single example is enough and the task isn't too complex.
+Used when format or style matters for the task isn't to complex and a single example is enough.
 
 **Example — QA Engineer/Tester:**
 
@@ -98,7 +98,7 @@ New scenario topic: Attempting to pay with an expired coupon code.
 
 ## 4. Few-Shot Prompting {#few-shot}
 
-A step beyond one-shot: you give the model **multiple examples (usually 2-5)** to teach it both the format and the **pattern/logic** across the examples. As the number of examples grows, the model captures the desired pattern more reliably — especially when the examples contain subtle differences (e.g. different scenarios, edge cases), few-shot gives more consistent results than one-shot.
+A step beyond one-shot: you give the model **multiple examples (usually 2-5)** to teach it both the format and the **pattern/logic** across the examples. As the number of examples grows, the model captures the desired pattern more reliably. Especially when the examples contains diversity (e.g. different scenarios, edge cases), few-shot can give more consistent results than one-shot.
 
 Few-shot is preferred when the goal contains more variety than a single example could fully capture (different situations, different tone/style variations).
 
@@ -132,7 +132,7 @@ The two examples show the model both the **tone** of the comment and its **struc
 
 ## 5. Structured Output {#structured-output}
 
-Instead of free-form text, you ask the model for output in **a specific format** (JSON, a table, YAML, a Markdown list, etc.). This matters a lot when the output needs to be processed automatically in a later step — fed into a system, or into a dashboard.
+Instead of free-form text, you ask the model for output in **a specific format** (JSON, a table, YAML, a Markdown list, etc.). This matters a lot when the output needs to be processed automatically in a later step eg. fed into a system, or into a dashboard.
 
 **Example — Delivery Manager:**
 
@@ -162,7 +162,7 @@ Requested JSON schema:
 
 ## 6. Chain of Thought {#chain-of-thought}
 
-Instead of asking the model to jump straight to a final answer, you ask it to reason **step by step** ("let's think step by step") on its way to a conclusion. Instructions like "think step by step" or "first list the options, then compare them, then decide" are part of this technique.
+Instead of asking the model to jump straight to a final answer, you ask it to reason **step by step** ("let's think step by step") on its way to a conclusion. Nowadays most of models have reasoning however instructions like "think step by step" or "first list the options, then compare them, then decide" still effective and they are part of this technique.
 
 **Example — Solution Architect:**
 
@@ -193,7 +193,7 @@ If we had simply asked the model "A or B?", we would likely get a shallow, one-d
 
 In a long or multi-part prompt, delimiters like `"""` or `---`, or XML-like tags such as `<context>...</context>` and `<data>...</data>`, are used to separate different sections (context, instructions, data, examples) from one another. This keeps the model from getting confused about "is this part an instruction, or is it data to be processed?"
 
-When a prompt contains more than one block of information — for example, both instructions and raw text to work on — using delimiters/XML significantly reduces confusion, especially in long prompts. Claude is particularly good at distinguishing XML tags, which is why this technique is frequently recommended when working with Claude.
+When a prompt contains more than one block of information, eg. both instructions and raw text to work on, using delimiters/XML can help to reduce confusion, especially in long prompts. Claude is particularly good at distinguishing XML tags, which is why this technique is frequently recommended when working with Claude yet it doesn't mean that it won't work for other providers. You can run experiments depending on your cases to see if its help. XML is not the only delimeters you could use for any LLM.
 
 **Example — Product Owner:**
 
@@ -226,9 +226,9 @@ The `<feedback>` and `<constraints>` tags let the model clearly tell apart which
 
 You tell the model to **take on a specific area of expertise** while producing its answer ("You are a senior security engineer..."). This steers the **perspective, prioritization, and terminology** in the model's answer toward that role's area of expertise.
 
-Assigning a persona doesn't give the model some new, unreal capability — the model filters the knowledge it already has through the lens of the requested role. In other words, a persona shapes "what the model focuses on" and "in what tone it speaks"; it isn't a magic source of expertise.
+Assigning a persona doesn't give the model some new, unreal capability. The model itself filters the knowledge it already has through the lens of the requested role. In other words, a persona shapes "what the model focuses on" and "in what tone it speaks". It isn't a magic source of expertise.
 
-Used when you want an evaluation, risk analysis, or feedback from a specific expert perspective, or when the output needs to be in a tone suited to a specific audience (e.g., executives).
+Used when you want an evaluation, risk analysis, or feedback from a specific expert perspective, or when the output needs to be in a tone suited to a specific audience (e.g., executives/managers).
 
 **Example**
 
